@@ -13,7 +13,7 @@ const server = new Server(
 
 // --- JXA execution ---
 
-function runJxa(script) {
+function runJxa(script, { timeout = 30000 } = {}) {
   try {
     const result = execSync(
       `osascript -l JavaScript << 'JXA_EOF'\n${script}\nJXA_EOF`,
@@ -21,7 +21,7 @@ function runJxa(script) {
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
         shell: "/bin/bash",
-        timeout: 30000,
+        timeout,
       }
     );
     return result.trim();
@@ -47,8 +47,8 @@ function runJxa(script) {
   }
 }
 
-function parseJxa(script) {
-  const raw = runJxa(script);
+function parseJxa(script, opts) {
+  const raw = runJxa(script, opts);
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -164,6 +164,55 @@ function runAppleScript(script) {
     }
     throw new Error(`AppleScript error: ${msg.slice(0, 200)}`);
   }
+}
+
+// --- Message location helper (fast lookup via JXA whose clause) ---
+
+// Gmail virtual folders that JXA can see but AppleScript can't reference
+const VIRTUAL_MAILBOXES = new Set([
+  "All Mail", "Important", "Starred", "[Gmail]/All Mail",
+  "[Gmail]/Important", "[Gmail]/Starred",
+]);
+
+function findMessageLocation(emailId) {
+  return parseJxa(`
+    const mail = Application("Mail");
+    const msgId = ${Number(emailId)};
+    const virtual = new Set(${JSON.stringify([...VIRTUAL_MAILBOXES])});
+
+    function find() {
+      let fallback = null;
+      const accounts = mail.accounts();
+      // Check INBOX first (most common target for reply/forward)
+      for (const acct of accounts) {
+        try {
+          const inbox = acct.mailboxes.whose({name: "INBOX"})();
+          if (inbox.length > 0) {
+            const msgs = inbox[0].messages.whose({id: msgId})();
+            if (msgs.length > 0) return {account: acct.name(), mailbox: "INBOX"};
+          }
+        } catch(e) {}
+      }
+      // Fall back to scanning all mailboxes
+      for (const acct of accounts) {
+        const boxes = acct.mailboxes();
+        for (const box of boxes) {
+          try {
+            const name = box.name();
+            if (name === "INBOX") continue; // Already checked
+            const msgs = box.messages.whose({id: msgId})();
+            if (msgs.length > 0) {
+              const loc = {account: acct.name(), mailbox: name};
+              if (!virtual.has(name)) return loc;
+              if (!fallback) fallback = loc;
+            }
+          } catch(e) {}
+        }
+      }
+      return fallback;
+    }
+    JSON.stringify(find());
+  `);
 }
 
 // --- Escape helpers ---
@@ -316,6 +365,8 @@ function handleSearchEmails(args) {
   const mailboxStr = escapeForJxa(mailboxName);
   const accountStr = accountName ? escapeForJxa(accountName) : "null";
 
+  // Longer timeout when searching (client-side scan can be slow on large mailboxes)
+  const searchTimeout = query ? 60000 : 30000;
   const data = parseJxa(`
     const mail = Application("Mail");
     const query = ${queryStr};
@@ -376,7 +427,7 @@ function handleSearchEmails(args) {
       }
     }
     JSON.stringify(results);
-  `);
+  `, { timeout: searchTimeout });
 
   if (!data || data.length === 0) {
     return ok(query ? `No emails matching "${query}".` : "No emails found.");
@@ -478,8 +529,10 @@ function handleCompose(args) {
     if (!emailId) return err("email_id required for reply/forward.");
     const replyAll = args?.reply_all || false;
 
-    // Use JXA to find the message reference, then AppleScript for the reply/forward
-    // because JXA's reply/forward support in Mail is unreliable
+    // Fast lookup via JXA, then targeted AppleScript for reply/forward
+    const loc = findMessageLocation(emailId);
+    if (!loc) return err(`Email ${emailId} not found.`);
+
     const action =
       mode === "reply"
         ? replyAll
@@ -487,31 +540,39 @@ function handleCompose(args) {
           : "reply msg with opening window"
         : "forward msg with opening window";
 
-    const script = `tell application "Mail"
-    set targetMsg to missing value
-    repeat with acct in every account
-        repeat with mbox in every mailbox of acct
-            try
-                set msgs to (every message of mbox whose id is ${Number(emailId)})
-                if (count of msgs) > 0 then
-                    set targetMsg to item 1 of msgs
-                    exit repeat
-                end if
-            end try
-        end repeat
-        if targetMsg is not missing value then exit repeat
-    end repeat
-    if targetMsg is missing value then return "Error: Email ${emailId} not found."
-    set msg to targetMsg
-    set replyMsg to ${action}
-    set content of replyMsg to "${escapedHtml}" & content of replyMsg
+    // Step 1: Open the reply/forward window
+    const openScript = `tell application "Mail"
+    set targetBox to mailbox "${escapeForAppleScript(loc.mailbox)}" of account "${escapeForAppleScript(loc.account)}"
+    set msgs to (every message of targetBox whose id is ${Number(emailId)})
+    if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
+    set msg to item 1 of msgs
+    ${action}
     activate
-    return "${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}."
+    return "ok"
 end tell`;
 
-    const result = runAppleScript(script);
-    if (result.startsWith("Error:")) return err(result.slice(7));
-    return ok(result);
+    const openResult = runAppleScript(openScript);
+    if (openResult.startsWith("Error:")) return err(openResult.slice(7));
+
+    // Step 2: If body provided, paste via clipboard to preserve quoted reply
+    if (body.trim()) {
+      try {
+        execSync(
+          `echo ${JSON.stringify(htmlBody)} | textutil -stdin -format html -inputencoding UTF-8 -convert rtf -stdout | pbcopy`,
+          { shell: "/bin/bash", timeout: 10000 }
+        );
+        execSync("sleep 0.5", { shell: "/bin/bash" });
+        runAppleScript(`tell application "System Events"
+    tell process "Mail"
+        keystroke "v" using command down
+    end tell
+end tell`);
+      } catch (e) {
+        // Paste failed but reply window is open — still usable
+      }
+    }
+
+    return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
   }
 
   return err(`Invalid mode: ${mode}. Use "new", "reply", or "forward".`);
@@ -526,33 +587,21 @@ function handleMoveEmail(args) {
 
   if (!emailId || !destination) return err("email_id and destination required.");
 
+  // Fast lookup via JXA
+  const loc = findMessageLocation(emailId);
+  if (!loc) return err(`Email ${emailId} not found.`);
+
+  const destAccount = accountName || loc.account;
+
   const script = `tell application "Mail"
-    set targetMsg to missing value
-    set sourceAcct to missing value
-    repeat with acct in every account
-        repeat with mbox in every mailbox of acct
-            try
-                set msgs to (every message of mbox whose id is ${Number(emailId)})
-                if (count of msgs) > 0 then
-                    set targetMsg to item 1 of msgs
-                    set sourceAcct to acct
-                    exit repeat
-                end if
-            end try
-        end repeat
-        if targetMsg is not missing value then exit repeat
-    end repeat
-    if targetMsg is missing value then return "Error: Email ${emailId} not found."
+    set targetBox to mailbox "${escapeForAppleScript(loc.mailbox)}" of account "${escapeForAppleScript(loc.account)}"
+    set msgs to (every message of targetBox whose id is ${Number(emailId)})
+    if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
+    set targetMsg to item 1 of msgs
     set destBox to missing value
-    ${
-      accountName
-        ? `try
-        set destBox to mailbox "${escapeForAppleScript(destination)}" of account "${escapeForAppleScript(accountName)}"
-    end try`
-        : `try
-        set destBox to mailbox "${escapeForAppleScript(destination)}" of sourceAcct
-    end try`
-    }
+    try
+        set destBox to mailbox "${escapeForAppleScript(destination)}" of account "${escapeForAppleScript(destAccount)}"
+    end try
     if destBox is missing value then return "Error: Mailbox '${escapeForAppleScript(destination)}' not found."
     move targetMsg to destBox
     return "Moved email ${emailId} to ${escapeForAppleScript(destination)}."

@@ -138,6 +138,14 @@ describe("escapeForAppleScript", () => {
     assert.equal(escapeForAppleScript('say "hi"'), 'say \\"hi\\"');
   });
 
+  it("escapes newlines", () => {
+    assert.equal(escapeForAppleScript("line1\nline2"), "line1\\nline2");
+  });
+
+  it("escapes carriage returns", () => {
+    assert.equal(escapeForAppleScript("line1\rline2"), "line1\\rline2");
+  });
+
   it("returns empty for empty string", () => {
     assert.equal(escapeForAppleScript(""), "");
   });
