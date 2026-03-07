@@ -125,7 +125,8 @@ describe("markdownToHtml", () => {
 
   it("passes plain text through wrapped in p tags", () => {
     const result = markdownToHtml("hello world");
-    assert.equal(result, "<p>hello world</p>");
+    assert.ok(result.includes("<p>hello world</p>"));
+    assert.ok(result.includes("font-family"));
   });
 });
 
