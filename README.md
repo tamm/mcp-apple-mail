@@ -92,6 +92,15 @@ Or add to `.mcp.json` in your project:
 - Attachments not supported
 - HTML emails are read as plain text (Mail.app `content` property returns plaintext extraction)
 
+## Acknowledgements
+
+This server was built independently but draws inspiration from two earlier projects in this space:
+
+- [imdinu/apple-mail-mcp](https://github.com/imdinu/apple-mail-mcp) — performance-focused Python server; its FTS5 body search approach validated the direction taken here
+- [patrickfreyer/apple-mail-mcp](https://github.com/patrickfreyer/apple-mail-mcp) — broad feature coverage including batch operations and companion Claude Code skills
+
+The decision to go deep on SQLite/emlx direct reads rather than scripting everything through JXA grew out of prior work on an Outlook MCP integration, where studying the problem space made the Apple Mail performance opportunity obvious.
+
 ## License
 
 MIT -- see [LICENSE](LICENSE).
