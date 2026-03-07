@@ -365,7 +365,7 @@ function handleSearchEmails(args) {
   const mailboxStr = escapeForJxa(mailboxName);
   const accountStr = accountName ? escapeForJxa(accountName) : "null";
 
-  // Longer timeout when searching (client-side scan can be slow on large mailboxes)
+  // Batch fetch is fast but still needs time for large mailboxes
   const searchTimeout = query ? 60000 : 30000;
   const data = parseJxa(`
     const mail = Application("Mail");
@@ -397,36 +397,84 @@ function handleSearchEmails(args) {
     for (const {box, account} of mailboxes) {
       let msgs;
       try {
-        msgs = box.messages();
+        msgs = box.messages;
       } catch(e) { continue; }
 
-      const count = msgs.length;
-      // Iterate from newest (highest index) to oldest
-      for (let i = count - 1; i >= 0 && results.length < limit; i--) {
+      const mboxName = box.name();
+
+      if (query) {
+        // Search mode: batch fetch subjects + senders, filter, then get details for matches
+        let subjects, senders, ids;
         try {
-          const m = msgs[i];
-          const subject = m.subject();
-          const sender = m.sender();
-          if (query) {
-            const q = query.toLowerCase();
-            const matchSubject = subject && subject.toLowerCase().includes(q);
-            const matchSender = sender && sender.toLowerCase().includes(q);
-            if (!matchSubject && !matchSender) continue;
-          }
+          ids = msgs.id();
+          subjects = msgs.subject();
+          senders = msgs.sender();
+        } catch(e) { continue; }
+        const q = query.toLowerCase();
+        const matchIdx = [];
+        for (let i = 0; i < ids.length; i++) {
+          const s = (subjects[i] || "").toLowerCase();
+          const f = (senders[i] || "").toLowerCase();
+          if (s.includes(q) || f.includes(q)) matchIdx.push(i);
+        }
+        // Fetch dates + flags only for matches
+        let dates, readArr, flaggedArr;
+        try {
+          dates = msgs.dateReceived();
+          readArr = msgs.readStatus();
+          flaggedArr = msgs.flaggedStatus();
+        } catch(e) { continue; }
+        for (const i of matchIdx) {
           results.push({
-            id: m.id(),
-            subject: subject || "(no subject)",
-            from: sender || "",
-            date: m.dateReceived().toISOString(),
-            read: m.readStatus(),
-            flagged: m.flaggedStatus(),
-            mailbox: box.name(),
+            id: ids[i],
+            subject: subjects[i] || "(no subject)",
+            from: senders[i] || "",
+            date: dates[i] ? dates[i].toISOString() : "",
+            read: readArr[i],
+            flagged: flaggedArr[i],
+            mailbox: mboxName,
             account: account
           });
-        } catch(e) {}
+        }
+      } else {
+        // Recent mode: batch fetch dates + ids, sort, take top N, then get details
+        let ids, dates;
+        try {
+          ids = msgs.id();
+          dates = msgs.dateReceived();
+        } catch(e) { continue; }
+        // Build index pairs and sort by date descending
+        const indexed = [];
+        for (let i = 0; i < ids.length; i++) {
+          indexed.push({i: i, date: dates[i] ? dates[i].getTime() : 0});
+        }
+        indexed.sort((a, b) => b.date - a.date);
+        const topN = indexed.slice(0, limit);
+        // Fetch remaining props for just these indices
+        let subjects, senders, readArr, flaggedArr;
+        try {
+          subjects = msgs.subject();
+          senders = msgs.sender();
+          readArr = msgs.readStatus();
+          flaggedArr = msgs.flaggedStatus();
+        } catch(e) { continue; }
+        for (const {i, date} of topN) {
+          results.push({
+            id: ids[i],
+            subject: subjects[i] || "(no subject)",
+            from: senders[i] || "",
+            date: dates[i] ? dates[i].toISOString() : "",
+            read: readArr[i],
+            flagged: flaggedArr[i],
+            mailbox: mboxName,
+            account: account
+          });
+        }
       }
     }
-    JSON.stringify(results);
+    // Final sort across all mailboxes
+    results.sort((a, b) => b.date.localeCompare(a.date));
+    JSON.stringify(results.slice(0, limit));
   `, { timeout: searchTimeout });
 
   if (!data || data.length === 0) {
@@ -498,11 +546,39 @@ function handleGetEmail(args) {
 
 // --- compose ---
 
+// Paste HTML body into Mail.app compose window via clipboard
+// Mail.app body is a WebView: window > group 1 > group 1 > scroll area 1
+function pasteHtmlBody(htmlBody) {
+  execSync(
+    `echo ${JSON.stringify(htmlBody)} | textutil -stdin -format html -inputencoding UTF-8 -convert rtf -stdout | pbcopy`,
+    { shell: "/bin/bash", timeout: 10000 }
+  );
+  runAppleScript(`tell application "Mail"
+    activate
+end tell
+delay 0.3
+tell application "System Events"
+    tell process "Mail"
+        tell front window
+            tell group 1
+                tell group 1
+                    tell scroll area 1
+                        set focused to true
+                        click
+                    end tell
+                end tell
+            end tell
+        end tell
+        delay 0.3
+        keystroke "v" using command down
+    end tell
+end tell`);
+}
+
 function handleCompose(args) {
   const mode = args?.mode;
   const body = args?.body || "";
   const htmlBody = markdownToHtml(body);
-  const escapedHtml = escapeForAppleScript(htmlBody);
 
   if (mode === "new") {
     const subject = args?.subject || "";
@@ -510,7 +586,7 @@ function handleCompose(args) {
     const cc = args?.cc || "";
 
     let script = `tell application "Mail"
-    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", content:"${escapedHtml}", visible:true}`;
+    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", content:"", visible:true}`;
 
     if (to) {
       script += `\n    tell newMsg\n        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}\n    end tell`;
@@ -518,10 +594,13 @@ function handleCompose(args) {
     if (cc) {
       script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:"${escapeForAppleScript(cc)}"}\n    end tell`;
     }
+    script += `\n    activate\nend tell`;
+    runAppleScript(script);
 
-    script += `\n    activate\nend tell\nreturn "Draft created: ${escapeForAppleScript(subject)}"`;
-    const result = runAppleScript(script);
-    return ok(result);
+    if (body.trim()) {
+      try { pasteHtmlBody(htmlBody); } catch (e) { /* window open, paste failed — still usable */ }
+    }
+    return ok(`Draft created: ${subject}`);
   }
 
   if (mode === "reply" || mode === "forward") {
@@ -529,7 +608,6 @@ function handleCompose(args) {
     if (!emailId) return err("email_id required for reply/forward.");
     const replyAll = args?.reply_all || false;
 
-    // Fast lookup via JXA, then targeted AppleScript for reply/forward
     const loc = findMessageLocation(emailId);
     if (!loc) return err(`Email ${emailId} not found.`);
 
@@ -540,8 +618,7 @@ function handleCompose(args) {
           : "reply msg with opening window"
         : "forward msg with opening window";
 
-    // Step 1: Open the reply/forward window
-    const openScript = `tell application "Mail"
+    const script = `tell application "Mail"
     set targetBox to mailbox "${escapeForAppleScript(loc.mailbox)}" of account "${escapeForAppleScript(loc.account)}"
     set msgs to (every message of targetBox whose id is ${Number(emailId)})
     if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
@@ -551,27 +628,12 @@ function handleCompose(args) {
     return "ok"
 end tell`;
 
-    const openResult = runAppleScript(openScript);
-    if (openResult.startsWith("Error:")) return err(openResult.slice(7));
+    const result = runAppleScript(script);
+    if (result.startsWith("Error:")) return err(result.slice(7));
 
-    // Step 2: If body provided, paste via clipboard to preserve quoted reply
     if (body.trim()) {
-      try {
-        execSync(
-          `echo ${JSON.stringify(htmlBody)} | textutil -stdin -format html -inputencoding UTF-8 -convert rtf -stdout | pbcopy`,
-          { shell: "/bin/bash", timeout: 10000 }
-        );
-        execSync("sleep 0.5", { shell: "/bin/bash" });
-        runAppleScript(`tell application "System Events"
-    tell process "Mail"
-        keystroke "v" using command down
-    end tell
-end tell`);
-      } catch (e) {
-        // Paste failed but reply window is open — still usable
-      }
+      try { pasteHtmlBody(htmlBody); } catch (e) { /* window open, paste failed — still usable */ }
     }
-
     return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
   }
 
