@@ -16,7 +16,9 @@ Lean MCP server for Apple Mail on macOS. Read, search, compose, and organise ema
 
 **Lean by design.** MCP tool descriptions and response payloads are kept minimal. Every token in a tool definition or result costs context window budget in the calling LLM. Short descriptions, compact one-line result formats, no unnecessary metadata.
 
-**JXA for reads, AppleScript for writes.** JXA (JavaScript for Automation) is used for read operations because it returns structured JSON natively. AppleScript is used for compose/reply/forward/move because JXA's Mail.app write support is unreliable -- reply and forward operations silently fail or produce corrupt messages in JXA.
+**JXA batch fetch for reads.** `search_emails` uses JXA batch property access (`msgs.subject()` returns all subjects in one IPC call) instead of per-message iteration. Results are sorted by date descending in JS to handle Gmail IMAP's unreliable message ordering. `findMessageLocation` checks INBOX first and skips Gmail virtual folders (All Mail, Important, Starred) that JXA can see but AppleScript can't reference.
+
+**AppleScript + clipboard paste for writes.** Compose/reply/forward use AppleScript to open the window, then clipboard paste for the body: `textutil` converts HTML to RTF, `pbcopy` copies it, System Events clicks the body WebView (`window > group 1 > group 1 > scroll area 1`) and pastes with Cmd+V. This is the only way to get rendered HTML into Mail.app — the `content` property only accepts plain text.
 
 **Signature and quote stripping.** `get_email` strips email signatures (`-- ` delimiter, mobile app signatures) and quoted reply chains (`On ... wrote:`, Outlook `From:/Sent:` blocks, `>` quote lines). This keeps the returned body to just the actual message content, saving tokens and reducing noise for the LLM.
 
@@ -30,7 +32,7 @@ Lean MCP server for Apple Mail on macOS. Read, search, compose, and organise ema
 - Compose opens a visible draft window; does not send automatically (by design, human-in-the-loop)
 - Attachments not supported
 - HTML emails are read as plain text (Mail.app `content` property returns plaintext extraction)
-- Large mailboxes with thousands of messages may be slow to search (iterates messages via scripting bridge)
+- Compose requires Accessibility permission for System Events (System Settings > Privacy & Security > Accessibility)
 
 ## Install
 
@@ -42,7 +44,7 @@ npm install
 Add to Claude Code:
 
 ```bash
-claude mcp add apple-mail node ~/dev/mcp-apple-mail/index.js
+claude mcp add apple-mail -- node ~/dev/mcp-apple-mail/index.js
 ```
 
 ## Prerequisites
