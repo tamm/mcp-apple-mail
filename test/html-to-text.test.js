@@ -85,7 +85,7 @@ describe("htmlToText", () => {
       <html>
       <head><style>.foo{color:blue}</style></head>
       <body>
-        <div>Hi Tamm,</div>
+        <div>Hi Alice,</div>
         <br>
         <p>Just following up on our conversation.</p>
         <p>Here&apos;s the link: <a href="https://example.com">click&nbsp;here</a></p>
@@ -94,7 +94,7 @@ describe("htmlToText", () => {
       </html>
     `;
     const result = htmlToText(html);
-    assert.ok(result.includes("Hi Tamm,"));
+    assert.ok(result.includes("Hi Alice,"));
     assert.ok(result.includes("Just following up on our conversation."));
     assert.ok(result.includes("click here"));
     assert.ok(result.includes("Cheers,"));
