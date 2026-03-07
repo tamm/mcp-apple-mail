@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test 'test/*.test.js'"
+    "test": "node --test 'test/*.test.js'",
+    "bench": "node test/benchmark.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1"
