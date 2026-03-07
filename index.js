@@ -848,65 +848,121 @@ function indexEmail(emailId, subject, sender, bodyText) {
   } catch {}
 }
 
-// Background backfill: index unindexed messages in small batches
-let backfillRunning = false;
-function backfillBatch(batchSize = 20) {
-  if (backfillRunning) return;
-  backfillRunning = true;
+// --- Background indexing queue ---
+//
+// Strategy: seed a queue table with all known message IDs (newest-first priority),
+// then drain it one email per tick. New emails are detected each tick and enqueued.
+// Passive get_email calls mark items done immediately, so hot emails are always indexed.
+// Resilient: skips missing .emlx files, resumes across restarts, never blocks the server.
+
+function ensureQueue() {
+  runFts(`CREATE TABLE IF NOT EXISTS queue (
+    id INTEGER PRIMARY KEY,
+    priority INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending'
+  )`);
+  runFts(`CREATE INDEX IF NOT EXISTS queue_status ON queue(status, priority DESC)`);
+}
+
+function seedQueue() {
+  // Only seed if queue is completely empty (first run or wiped)
+  const existing = parseFts(`SELECT COUNT(*) as n FROM queue`);
+  if ((existing[0]?.n || 0) > 0) return;
 
   try {
-    // Get the set of already-indexed IDs
-    const indexedRows = parseFts(`SELECT id FROM indexed`);
-    const indexedSet = new Set(indexedRows.map(r => r.id));
+    const ids = parseSqlite(`SELECT ROWID as id, date_received FROM messages ORDER BY date_received DESC`);
+    if (!ids.length) return;
 
-    // Fetch recent messages from Envelope Index, newest first
-    const candidates = parseSqlite(`
-      SELECT m.ROWID as id FROM messages m
-      ORDER BY m.date_received DESC
-      LIMIT ${batchSize * 5}
-    `);
-
-    // Filter to ones not yet indexed
-    const unindexed = [];
-    for (const c of candidates) {
-      if (!indexedSet.has(c.id)) unindexed.push(c.id);
-      if (unindexed.length >= batchSize) break;
+    // Batch insert in chunks of 500 to avoid huge SQL strings
+    const CHUNK = 500;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const chunk = ids.slice(i, i + CHUNK);
+      const vals = chunk.map((r, j) => `(${r.id}, ${ids.length - i - j})`).join(",");
+      runFts(`INSERT OR IGNORE INTO queue (id, priority) VALUES ${vals}`);
     }
+  } catch {}
+}
 
-    for (const id of unindexed) {
-      try {
-        const emlxPath = findEmlxPath(id);
-        if (!emlxPath) continue;
+function enqueueNewEmails() {
+  // Find IDs above our current max queue ID — these are emails that arrived since last seed
+  try {
+    const maxKnown = parseFts(`SELECT MAX(id) as m FROM queue`);
+    const since = maxKnown[0]?.m || 0;
+    if (!since) return;
+    const newIds = parseSqlite(`SELECT ROWID as id FROM messages WHERE ROWID > ${since} ORDER BY ROWID ASC`);
+    if (!newIds.length) return;
+    const vals = newIds.map(r => `(${r.id}, 999999, 'pending')`).join(",");
+    runFts(`INSERT OR IGNORE INTO queue (id, priority, status) VALUES ${vals}`);
+  } catch {}
+}
+
+function markQueueDone(id) {
+  try { runFts(`UPDATE queue SET status = 'done' WHERE id = ${Number(id)}`); } catch {}
+}
+
+let drainBusy = false;
+
+function drainOne() {
+  if (drainBusy) return;
+  drainBusy = true;
+  try {
+    // Check for new emails each tick (cheap — only looks at IDs above our max known)
+    enqueueNewEmails();
+
+    const rows = parseFts(`SELECT id FROM queue WHERE status = 'pending' ORDER BY priority DESC LIMIT 1`);
+    if (!rows.length) return;
+
+    const id = rows[0].id;
+    try {
+      const emlxPath = findEmlxPath(id);
+      if (emlxPath) {
         const data = parseEmlx(emlxPath);
         indexEmail(id, data.subject, data.from, data.body);
-      } catch {}
+      }
+      // Mark done whether we indexed or not (missing file = skip permanently)
+      markQueueDone(id);
+    } catch {
+      markQueueDone(id); // Don't retry broken emails
     }
   } catch {} finally {
-    backfillRunning = false;
+    drainBusy = false;
   }
 }
 
-// Schedule periodic backfill (every 30s when server is running)
-let backfillTimer = null;
+let drainTimer = null;
 function startBackfill() {
   ensureFtsDb();
-  // Do an initial small batch immediately
-  setTimeout(() => backfillBatch(50), 5000);
-  // Then every 30s
-  backfillTimer = setInterval(() => backfillBatch(30), 30000);
+  ensureQueue();
+  // Seed queue after a short delay so server starts fast
+  setTimeout(() => {
+    seedQueue();
+    drainOne();
+    // 500ms per email = ~7200/hr, gentle but not glacial
+    drainTimer = setInterval(drainOne, 500);
+  }, 3000);
 }
 
 function ftsIndexStats() {
   try {
     const indexed = parseFts(`SELECT COUNT(*) as n FROM indexed`);
     const total = parseSqlite(`SELECT COUNT(*) as n FROM messages`);
+    const pending = parseFts(`SELECT COUNT(*) as n FROM queue WHERE status = 'pending'`);
     return {
       indexed: indexed[0]?.n || 0,
       total: total[0]?.n || 0,
+      pending: pending[0]?.n || 0,
     };
   } catch {
-    return { indexed: 0, total: 0 };
+    return { indexed: 0, total: 0, pending: 0 };
   }
+}
+
+function ftsStatusLine(stats) {
+  const { indexed, total, pending } = stats;
+  if (!total) return "Index: empty";
+  const pct = Math.round((indexed / total) * 100);
+  if (pending === 0) return `Index: complete (${indexed.toLocaleString()} emails)`;
+  return `Index: ${pct}% complete — ${indexed.toLocaleString()}/${total.toLocaleString()} indexed, ${pending.toLocaleString()} queued. Results may be incomplete.`;
 }
 
 function handleSearchEmails(args) {
@@ -1036,7 +1092,7 @@ function handleGetEmail(args) {
       const body = cleanBody(data.body);
 
       // Index body text for FTS5 search (fire-and-forget)
-      try { indexEmail(emailId, data.subject, data.from, data.body); } catch {}
+      try { indexEmail(emailId, data.subject, data.from, data.body); markQueueDone(emailId); } catch {}
 
       const parts = [
         `Subject: ${data.subject || "(no subject)"}`,
@@ -1090,7 +1146,7 @@ function handleGetEmail(args) {
   const body = cleanBody(data.body);
 
   // Index body text for FTS5 search (fire-and-forget)
-  try { indexEmail(emailId, data.subject, data.from, data.body); } catch {}
+  try { indexEmail(emailId, data.subject, data.from, data.body); markQueueDone(emailId); } catch {}
 
   const parts = [
     `Subject: ${data.subject}`,
@@ -1139,7 +1195,7 @@ function handleSearchBody(args) {
     `);
     if (!results2 || results2.length === 0) {
       const stats = ftsIndexStats();
-      return ok(`No results for "${query}". Index: ${stats.indexed}/${stats.total} emails indexed.`);
+      return ok(`No results for "${query}". ${ftsStatusLine(stats)}`);
     }
     return formatBodyResults(results2, query);
   }
@@ -1163,7 +1219,7 @@ function formatBodyResults(results, query) {
     const snippet = (r.snippet || "").replace(/\n/g, " ").trim();
     return `ID:${r.id} | ${date} | ${r.sender || ""} | ${r.subject || "(no subject)"}\n  ${snippet}`;
   });
-  lines.push(`\nIndex: ${stats.indexed}/${stats.total} emails indexed`);
+  lines.push(`\n${ftsStatusLine(stats)}`);
   return ok(lines.join("\n"));
 }
 

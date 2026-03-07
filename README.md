@@ -27,8 +27,8 @@ This server reads Mail.app's SQLite database (`Envelope Index`) directly for sea
 |------|--------|---------|
 | `list_mailboxes` | (none) | Account/mailbox names with unread counts |
 | `search_emails` | `query?`, `mailbox?` (default INBOX), `account?`, `limit?` (default 10, max 50) | One-line summaries: ID, date, sender, subject, read/flagged status |
-| `search_emails_fast` | `query?`, `mailbox?`, `account?`, `limit?` | Same format, SQLite fast path |
 | `get_email` | `email_id` | Headers + cleaned body (signatures and quoted replies stripped) |
+| `search_body` | `query`, `limit?` (default 20) | Relevance-ranked full-text results with body snippets; includes index coverage status |
 | `compose` | `mode` (new/reply/forward), `body` (markdown), `to?`, `subject?`, `cc?`, `email_id?`, `reply_all?` | Opens compose window in Mail.app with draft |
 | `move_email` | `email_id`, `destination`, `account?` | Confirmation message |
 | `archive_emails` | `email_ids` (array), `account?` | Archive summary (Gmail: removes INBOX label) |
@@ -79,13 +79,15 @@ Or add to `.mcp.json` in your project:
 
 **Signature and quote stripping.** `get_email` strips email signatures (`-- ` delimiter, mobile app signatures) and quoted reply chains (`On ... wrote:`, Outlook `From:/Sent:` blocks, `>` quote lines). This keeps the returned body to just the actual message content, saving tokens.
 
+**FTS5 body index.** `search_body` uses a local SQLite FTS5 database (`~/.mcp-apple-mail/body-index.db`). It builds incrementally: every `get_email` call indexes that message immediately; a background queue drains the full mailbox at ~7,200 emails/hour without hammering disk. The index persists across restarts and reports coverage (`N% complete — X/Y indexed`) on every result so callers know whether to trust completeness.
+
 **Markdown body input.** `compose` accepts markdown and converts to basic HTML. This lets the LLM write natural markdown without needing to construct HTML.
 
 ## Known Limitations
 
 - macOS only (uses `osascript` for JXA and AppleScript)
 - Mail.app must be running and configured with at least one account
-- Search is subject/sender only (no full-text body search -- Mail.app scripting limitation)
+- `search_emails` searches subject/sender only; use `search_body` for full-text (index builds incrementally in the background)
 - Compose opens a visible draft window; does not send automatically (by design, human-in-the-loop)
 - Attachments not supported
 - HTML emails are read as plain text (Mail.app `content` property returns plaintext extraction)
