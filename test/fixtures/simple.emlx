@@ -1,0 +1,9 @@
+198
+From: alice@example.com
+To: bob@example.com
+Cc: charlie@example.com
+Subject: Hello mate
+Date: Mon, 5 Jan 2026 10:00:00 +1100
+Content-Type: text/plain; charset=utf-8
+
+G'day Bob, how are things going?

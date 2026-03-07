@@ -1,0 +1,8 @@
+216
+From: dave@example.com
+To: eve@example.com
+Subject: HTML Newsletter
+Date: Tue, 6 Jan 2026 09:00:00 +1100
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>Welcome to the newsletter</p><p>Cheers</p></body></html>

@@ -1,0 +1,16 @@
+372
+From: frank@example.com
+To: grace@example.com
+Subject: Multipart Message
+Date: Wed, 7 Jan 2026 14:30:00 +1100
+Content-Type: multipart/alternative; boundary="boundary123"
+
+--boundary123
+Content-Type: text/plain; charset=utf-8
+
+Plain text version here.
+--boundary123
+Content-Type: text/html; charset=utf-8
+
+<html><body><b>HTML version</b> here.</body></html>
+--boundary123--

@@ -4,7 +4,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execSync } from "child_process";
+import { execSync, exec } from "child_process";
+import { readFileSync, accessSync, readdirSync, existsSync, mkdirSync, constants as fsConst } from "fs";
+import { join } from "path";
 
 const server = new Server(
   { name: "mcp-apple-mail", version: "1.0.0" },
@@ -145,7 +147,7 @@ function markdownToHtml(text) {
 
 // --- AppleScript for write ops (JXA's Mail.app write support is flaky) ---
 
-function runAppleScript(script) {
+function runAppleScript(script, { timeout = 30000 } = {}) {
   try {
     const result = execSync(
       `osascript << 'APPLESCRIPT_EOF'\n${script}\nAPPLESCRIPT_EOF`,
@@ -153,20 +155,20 @@ function runAppleScript(script) {
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
         shell: "/bin/bash",
-        timeout: 30000,
+        timeout,
       }
     );
     return result.trim();
   } catch (error) {
     const msg = error.message || "";
     if (msg.includes("ETIMEDOUT") || error.killed) {
-      throw new Error("AppleScript timed out (>30s). Mail.app may be unresponsive.");
+      throw new Error(`AppleScript timed out (>${timeout / 1000}s). Mail.app may be unresponsive.`);
     }
     throw new Error(`AppleScript error: ${msg.slice(0, 200)}`);
   }
 }
 
-// --- Message location helper (fast lookup via JXA whose clause) ---
+// --- Message location helper (SQLite fast path, JXA fallback) ---
 
 // Gmail virtual folders that JXA can see but AppleScript can't reference
 const VIRTUAL_MAILBOXES = new Set([
@@ -175,6 +177,40 @@ const VIRTUAL_MAILBOXES = new Set([
 ]);
 
 function findMessageLocation(emailId) {
+  // Try SQLite first (~1ms vs ~2.8s for JXA scan)
+  try {
+    const id = Number(emailId);
+    // Check labels table first (Gmail virtual folders like INBOX)
+    const labelRows = parseSqlite(`
+      SELECT mb.url FROM labels l
+      JOIN mailboxes mb ON mb.ROWID = l.mailbox_id
+      WHERE l.message_id = ${id}
+    `);
+    // Also check direct mailbox
+    const directRows = parseSqlite(`
+      SELECT mb.url FROM messages m
+      JOIN mailboxes mb ON mb.ROWID = m.mailbox
+      WHERE m.ROWID = ${id}
+    `);
+
+    const allUrls = [...labelRows, ...directRows].map(r => r.url);
+    // Prefer non-virtual mailbox (INBOX > All Mail)
+    let best = null;
+    let fallback = null;
+    for (const url of allUrls) {
+      const mbox = mailboxFromUrl(url);
+      const account = accountFromUrl(url);
+      const loc = { account, mailbox: mbox };
+      if (!VIRTUAL_MAILBOXES.has(mbox)) {
+        best = loc;
+        break;
+      }
+      if (!fallback) fallback = loc;
+    }
+    if (best || fallback) return best || fallback;
+  } catch (e) {}
+
+  // JXA fallback if SQLite fails
   return parseJxa(`
     const mail = Application("Mail");
     const msgId = ${Number(emailId)};
@@ -183,7 +219,6 @@ function findMessageLocation(emailId) {
     function find() {
       let fallback = null;
       const accounts = mail.accounts();
-      // Check INBOX first (most common target for reply/forward)
       for (const acct of accounts) {
         try {
           const inbox = acct.mailboxes.whose({name: "INBOX"})();
@@ -193,13 +228,12 @@ function findMessageLocation(emailId) {
           }
         } catch(e) {}
       }
-      // Fall back to scanning all mailboxes
       for (const acct of accounts) {
         const boxes = acct.mailboxes();
         for (const box of boxes) {
           try {
             const name = box.name();
-            if (name === "INBOX") continue; // Already checked
+            if (name === "INBOX") continue;
             const msgs = box.messages.whose({id: msgId})();
             if (msgs.length > 0) {
               const loc = {account: acct.name(), mailbox: name};
@@ -236,8 +270,13 @@ function escapeForJxa(str) {
 const TOOLS = [
   {
     name: "list_mailboxes",
-    description: "List accounts and mailboxes with unread counts.",
-    inputSchema: { type: "object", properties: {} },
+    description: "List accounts and mailboxes. Optionally include unread counts (slower).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_counts: { type: "boolean", description: "Include unread counts per mailbox. Slower due to aggregate query." },
+      },
+    },
   },
   {
     name: "search_emails",
@@ -248,7 +287,11 @@ const TOOLS = [
         query: { type: "string", description: "Search subject/sender. Omit for recent." },
         mailbox: { type: "string", description: "Mailbox (default: INBOX)." },
         account: { type: "string", description: "Account. Omit for all." },
-        limit: { type: "number", description: "Max results (default 10, max 50)." },
+        limit: { type: "number", description: "Max results (default 10)." },
+        unread_only: { type: "boolean", description: "Only return unread emails." },
+        sort: { type: "string", enum: ["desc", "asc"], description: "Sort by date: desc (default) or asc (oldest first)." },
+        after: { type: "string", description: "Only emails after this date (YYYY-MM-DD)." },
+        before: { type: "string", description: "Only emails before this date (YYYY-MM-DD)." },
       },
     },
   },
@@ -293,6 +336,34 @@ const TOOLS = [
       required: ["email_id", "destination"],
     },
   },
+  {
+    name: "archive_emails",
+    description: "Archive emails (remove from INBOX). Gmail: keeps in All Mail. Takes multiple IDs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email_ids: {
+          type: "array",
+          items: { type: "number" },
+          description: "Array of email IDs to archive.",
+        },
+        account: { type: "string", description: "Account (default: auto-detect)." },
+      },
+      required: ["email_ids"],
+    },
+  },
+  {
+    name: "search_body",
+    description: "Full-text body search using FTS5 index. Index builds incrementally as emails are read. Returns relevance-ranked results.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search terms for body/subject/sender." },
+        limit: { type: "number", description: "Max results (default 20)." },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -303,21 +374,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const t0 = Date.now();
   try {
+    let result;
     switch (name) {
       case "list_mailboxes":
-        return handleListMailboxes();
+        result = handleListMailboxes(args); break;
       case "search_emails":
-        return handleSearchEmails(args);
+        result = handleSearchEmails(args); break;
       case "get_email":
-        return handleGetEmail(args);
+        result = handleGetEmail(args); break;
       case "compose":
-        return handleCompose(args);
+        result = handleCompose(args); break;
       case "move_email":
-        return handleMoveEmail(args);
+        result = handleMoveEmail(args); break;
+      case "archive_emails":
+        result = handleArchiveEmails(args); break;
+      case "search_body":
+        result = handleSearchBody(args); break;
       default:
         return err(`Unknown tool: ${name}`);
     }
+    const ms = Date.now() - t0;
+    if (result.content?.[0]?.text) {
+      result.content[0].text += `\n\n⏱ ${ms}ms`;
+    }
+    return result;
   } catch (error) {
     return err(error.message);
   }
@@ -333,158 +415,605 @@ function err(text) {
 
 // --- list_mailboxes ---
 
-function handleListMailboxes() {
-  const data = parseJxa(`
-    const mail = Application("Mail");
-    const accounts = mail.accounts();
-    const result = [];
-    for (const acct of accounts) {
-      const name = acct.name();
-      const boxes = acct.mailboxes();
-      for (const box of boxes) {
-        try {
-          result.push(name + "/" + box.name() + " (" + box.unreadCount() + " unread)");
-        } catch(e) {}
-      }
+function handleListMailboxes(args) {
+  const rows = parseSqlite(`SELECT ROWID, url FROM mailboxes ORDER BY url`);
+  if (!rows || rows.length === 0) return ok("No mailboxes found.");
+
+  let unreadMap = {};
+  if (args?.include_counts) {
+    const counts = parseSqlite(`
+      SELECT mb_id, COUNT(*) as unread FROM (
+        SELECT l.mailbox_id as mb_id FROM labels l JOIN messages m ON m.ROWID = l.message_id WHERE m.read = 0
+        UNION ALL
+        SELECT m.mailbox as mb_id FROM messages m WHERE m.read = 0
+      ) GROUP BY mb_id
+    `);
+    for (const c of counts) unreadMap[c.mb_id] = c.unread;
+  }
+
+  const lines = rows.map(r => {
+    const account = accountFromUrl(r.url);
+    const mailbox = mailboxFromUrl(r.url);
+    if (args?.include_counts) {
+      const unread = unreadMap[r.ROWID] || 0;
+      return `${account}/${mailbox} (${unread} unread)`;
     }
-    JSON.stringify(result);
-  `);
-  if (!data || data.length === 0) return ok("No mailboxes found.");
-  return ok(data.join("\n"));
+    return `${account}/${mailbox}`;
+  });
+  return ok(lines.join("\n"));
 }
 
 // --- search_emails ---
+
+// --- search_emails (SQLite direct read) ---
+
+const ENVELOPE_DB = `${process.env.HOME}/Library/Mail/V10/MailData/Envelope Index`;
+const MAIL_V10_DIR = `${process.env.HOME}/Library/Mail/V10`;
+
+// --- .emlx direct file read ---
+
+// Discover the internal UUID used inside .mbox dirs (same across all accounts)
+let internalUuid = null;
+function discoverInternalUuid() {
+  try {
+    const accountDirs = readdirSync(MAIL_V10_DIR).filter(d => /^[A-F0-9]{8}-/.test(d));
+    for (const acctDir of accountDirs) {
+      const mboxes = readdirSync(`${MAIL_V10_DIR}/${acctDir}`).filter(d => d.endsWith(".mbox"));
+      for (const mbox of mboxes) {
+        const entries = readdirSync(`${MAIL_V10_DIR}/${acctDir}/${mbox}`).filter(d => /^[A-F0-9]{8}-/.test(d));
+        if (entries.length > 0) { internalUuid = entries[0]; return; }
+      }
+    }
+  } catch {}
+}
+
+// Shard dirs: Data/X/Y/Messages where X=0-9, Y=1-6
+const SHARD_PAIRS = [];
+for (let x = 0; x <= 9; x++) for (let y = 1; y <= 6; y++) SHARD_PAIRS.push(`${x}/${y}`);
+
+function accountUuidFromUrl(url) {
+  const m = url.match(/^[a-z]+:\/\/([A-F0-9-]+)\//i);
+  return m ? m[1] : null;
+}
+
+// Map mailbox URL to .mbox filesystem path segments
+// e.g. imap://UUID/%5BGmail%5D/All%20Mail -> ["[Gmail].mbox", "All Mail.mbox"]
+function mboxPathFromUrl(url) {
+  const m = url.match(/^[a-z]+:\/\/[A-F0-9-]+\/(.+)$/i);
+  if (!m) return null;
+  return m[1].split("/").map(s => decodeURIComponent(s) + ".mbox");
+}
+
+function findEmlxPath(emailId) {
+  if (!internalUuid) return null;
+  const id = Number(emailId);
+
+  // Get the mailbox URL where the file physically lives
+  // For Gmail, that's All Mail (messages.mailbox), not the label mailbox
+  const rows = parseSqlite(`SELECT mb.url FROM messages m JOIN mailboxes mb ON mb.ROWID = m.mailbox WHERE m.ROWID = ${id}`);
+  if (!rows.length) return null;
+
+  const url = rows[0].url;
+  const acctUuid = accountUuidFromUrl(url);
+  const mboxSegs = mboxPathFromUrl(url);
+  if (!acctUuid || !mboxSegs) return null;
+
+  const mboxDir = `${MAIL_V10_DIR}/${acctUuid}/${mboxSegs.join("/")}/${internalUuid}/Data`;
+
+  // Brute-force shard dirs (<1ms on SSD)
+  for (const shard of SHARD_PAIRS) {
+    const path = `${mboxDir}/${shard}/Messages/${id}.emlx`;
+    try {
+      accessSync(path, fsConst.R_OK);
+      return path;
+    } catch {}
+  }
+  // Also check un-sharded Messages dir
+  const flatPath = `${mboxDir}/Messages/${id}.emlx`;
+  try {
+    accessSync(flatPath, fsConst.R_OK);
+    return flatPath;
+  } catch {}
+
+  return null;
+}
+
+function parseEmlx(filePath) {
+  const buf = readFileSync(filePath);
+  // First line is byte count of the RFC822 message
+  const newline = buf.indexOf(0x0A); // \n
+  const byteCount = parseInt(buf.slice(0, newline).toString("utf-8"), 10);
+  // Slice by bytes, then decode to string
+  const rfc822 = buf.slice(newline + 1, newline + 1 + byteCount).toString("utf-8");
+
+  // Split headers from body
+  const headerEnd = rfc822.indexOf("\r\n\r\n");
+  const headerEndAlt = rfc822.indexOf("\n\n");
+  let headers, body;
+  if (headerEnd !== -1 && (headerEndAlt === -1 || headerEnd < headerEndAlt)) {
+    headers = rfc822.slice(0, headerEnd);
+    body = rfc822.slice(headerEnd + 4);
+  } else if (headerEndAlt !== -1) {
+    headers = rfc822.slice(0, headerEndAlt);
+    body = rfc822.slice(headerEndAlt + 2);
+  } else {
+    headers = rfc822;
+    body = "";
+  }
+
+  // Parse headers (unfold continuation lines)
+  const unfolded = headers.replace(/\r?\n[ \t]+/g, " ");
+  const getHeader = (name) => {
+    const re = new RegExp(`^${name}:\\s*(.*)$`, "im");
+    const m = unfolded.match(re);
+    return m ? m[1].trim() : "";
+  };
+
+  const subject = decodeMimeWords(getHeader("Subject"));
+  const from = decodeMimeWords(getHeader("From"));
+  const to = decodeMimeWords(getHeader("To"));
+  const cc = decodeMimeWords(getHeader("Cc") || getHeader("CC"));
+  const date = getHeader("Date");
+  const contentType = getHeader("Content-Type");
+  const contentTransferEncoding = getHeader("Content-Transfer-Encoding");
+
+  // Decode body
+  let decodedBody = body;
+  if (/quoted-printable/i.test(contentTransferEncoding)) {
+    decodedBody = decodeQuotedPrintable(decodedBody);
+  } else if (/base64/i.test(contentTransferEncoding)) {
+    try {
+      decodedBody = Buffer.from(decodedBody.replace(/\s/g, ""), "base64").toString("utf-8");
+    } catch {}
+  }
+
+  // If HTML, extract text
+  if (/text\/html/i.test(contentType)) {
+    decodedBody = htmlToText(decodedBody);
+  }
+
+  // Handle multipart
+  if (/multipart/i.test(contentType)) {
+    decodedBody = extractTextFromMultipart(body, contentType);
+  }
+
+  return { subject, from, to, cc, date, body: decodedBody };
+}
+
+function decodeMimeWords(str) {
+  // Decode =?charset?encoding?text?= sequences in headers
+  // Also collapse whitespace between adjacent encoded words
+  return str
+    .replace(/\?=\s+=\?/g, "?==?")
+    .replace(/=\?([^?]+)\?([BQbq])\?([^?]*)\?=/g, (_, charset, enc, text) => {
+      if (enc.toUpperCase() === "B") {
+        return Buffer.from(text, "base64").toString(charset.toLowerCase() === "utf-8" ? "utf-8" : "latin1");
+      }
+      // Q encoding — collect bytes then decode as buffer for proper multi-byte
+      const bytes = [];
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === "_") { bytes.push(0x20); }
+        else if (text[i] === "=" && i + 2 < text.length) {
+          bytes.push(parseInt(text.slice(i + 1, i + 3), 16));
+          i += 2;
+        } else { bytes.push(text.charCodeAt(i)); }
+      }
+      return Buffer.from(bytes).toString("utf-8");
+    });
+}
+
+function decodeQuotedPrintable(str) {
+  // Remove soft line breaks first, then decode byte sequences via Buffer for proper UTF-8
+  const stripped = str.replace(/=\r?\n/g, "");
+  const bytes = [];
+  for (let i = 0; i < stripped.length; i++) {
+    if (stripped[i] === "=" && i + 2 < stripped.length && /[0-9A-Fa-f]{2}/.test(stripped.slice(i + 1, i + 3))) {
+      bytes.push(parseInt(stripped.slice(i + 1, i + 3), 16));
+      i += 2;
+    } else {
+      // Push UTF-8 bytes of the literal character
+      const code = stripped.charCodeAt(i);
+      if (code < 0x80) bytes.push(code);
+      else {
+        // Multi-byte literal chars — encode to buffer and spread
+        const b = Buffer.from(stripped[i], "utf-8");
+        for (let j = 0; j < b.length; j++) bytes.push(b[j]);
+      }
+    }
+  }
+  return Buffer.from(bytes).toString("utf-8");
+}
+
+function htmlToText(html) {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/tr>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractTextFromMultipart(body, contentType) {
+  const boundaryMatch = contentType.match(/boundary="?([^";\s]+)"?/i);
+  if (!boundaryMatch) return body;
+  const boundary = boundaryMatch[1];
+  const parts = body.split("--" + boundary);
+
+  // Prefer text/plain, fall back to text/html
+  let plainText = null;
+  let htmlText = null;
+  for (const part of parts) {
+    if (part.startsWith("--")) continue; // closing boundary
+    const partHeaderEnd = part.indexOf("\r\n\r\n");
+    const partHeaderEndAlt = part.indexOf("\n\n");
+    let partHeaders, partBody;
+    if (partHeaderEnd !== -1 && (partHeaderEndAlt === -1 || partHeaderEnd < partHeaderEndAlt)) {
+      partHeaders = part.slice(0, partHeaderEnd);
+      partBody = part.slice(partHeaderEnd + 4);
+    } else if (partHeaderEndAlt !== -1) {
+      partHeaders = part.slice(0, partHeaderEndAlt);
+      partBody = part.slice(partHeaderEndAlt + 2);
+    } else continue;
+
+    const cte = partHeaders.match(/Content-Transfer-Encoding:\s*(\S+)/i);
+    if (cte && /quoted-printable/i.test(cte[1])) {
+      partBody = decodeQuotedPrintable(partBody);
+    } else if (cte && /base64/i.test(cte[1])) {
+      try { partBody = Buffer.from(partBody.replace(/\s/g, ""), "base64").toString("utf-8"); } catch {}
+    }
+
+    // Unfold continuation lines for header matching
+    const unfoldedPH = partHeaders.replace(/\r?\n[ \t]+/g, " ");
+
+    if (/text\/plain/i.test(unfoldedPH)) {
+      plainText = partBody.trim();
+    } else if (/text\/html/i.test(unfoldedPH)) {
+      htmlText = htmlToText(partBody).trim();
+    } else if (/multipart/i.test(unfoldedPH)) {
+      // Nested multipart — recurse with unfolded Content-Type
+      const nestedCt = unfoldedPH.match(/Content-Type:\s*(.+)/i);
+      if (nestedCt) {
+        const nested = extractTextFromMultipart(partBody, nestedCt[1]);
+        if (nested) plainText = nested;
+      }
+    }
+  }
+  return plainText || htmlText || body;
+}
+
+// Map account UUIDs from mailbox URLs to human-readable names
+// Eagerly cached at startup, SWR on subsequent calls
+let accountNameCache = {};
+
+function fetchAccountNames() {
+  const fresh = {};
+  try {
+    const data = parseJxa(`
+      var mail = Application("Mail");
+      var accts = mail.accounts();
+      var result = [];
+      for (var i = 0; i < accts.length; i++) {
+        result.push({id: accts[i].id(), name: accts[i].name()});
+      }
+      JSON.stringify(result);
+    `);
+    if (data) for (const a of data) fresh[a.id] = a.name;
+  } catch (e) {}
+  return fresh;
+}
+
+function refreshAccountNamesAsync() {
+  // Fire-and-forget background refresh
+  import("child_process").then(({ exec }) => {
+    exec(
+      `osascript -l JavaScript -e 'var m=Application("Mail");var a=m.accounts();var r=[];for(var i=0;i<a.length;i++)r.push(JSON.stringify({id:a[i].id(),name:a[i].name()}));r.join("\\n")'`,
+      { timeout: 10000 },
+      (err, stdout) => {
+        if (err || !stdout) return;
+        const fresh = {};
+        for (const line of stdout.trim().split("\n")) {
+          try {
+            const o = JSON.parse(line);
+            fresh[o.id] = o.name;
+          } catch {}
+        }
+        if (Object.keys(fresh).length > 0) accountNameCache = fresh;
+      }
+    );
+  });
+}
+
+let lastRefresh = 0;
+function getAccountNames() {
+  // SWR: refresh at most once per 60s
+  const now = Date.now();
+  if (now - lastRefresh > 60000) {
+    lastRefresh = now;
+    refreshAccountNamesAsync();
+  }
+  return accountNameCache;
+}
+
+// Warm cache at startup (blocking, once) — guarded for testability
+function warmCaches() {
+  discoverInternalUuid();
+  accountNameCache = fetchAccountNames();
+}
+
+function accountFromUrl(url) {
+  // imap://UUID/... or local://UUID/...
+  const m = url.match(/^[a-z]+:\/\/([A-F0-9-]+)\//i);
+  if (!m) return "Local";
+  const names = getAccountNames();
+  return names[m[1]] || m[1];
+}
+
+function mailboxFromUrl(url) {
+  // Last path segment, URL-decoded
+  const parts = url.split("/");
+  return decodeURIComponent(parts[parts.length - 1]);
+}
+
+function runSqlite(query) {
+  const q = query.replace(/\s+/g, " ").trim();
+  try {
+    return execSync(
+      `sqlite3 -json ${JSON.stringify(ENVELOPE_DB)} ${JSON.stringify(q)}`,
+      { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
+    ).trim();
+  } catch (error) {
+    throw new Error(`SQLite error: ${(error.message || "").slice(0, 200)}`);
+  }
+}
+
+function parseSqlite(query) {
+  const raw = runSqlite(query);
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+// --- FTS5 body search index (incremental, built on read) ---
+
+const FTS_DIR = join(process.env.HOME || "", ".mcp-apple-mail");
+const FTS_DB = join(FTS_DIR, "body-index.db");
+
+function ensureFtsDb() {
+  if (!existsSync(FTS_DIR)) mkdirSync(FTS_DIR, { recursive: true });
+  runFts(`CREATE TABLE IF NOT EXISTS indexed (id INTEGER PRIMARY KEY, ts INTEGER)`);
+  // Use a content-less FTS5 table — we only need to search, not retrieve body from the index.
+  // We store a snippet-sized body_snippet for search result previews.
+  runFts(`CREATE TABLE IF NOT EXISTS bodies (id INTEGER PRIMARY KEY, subject TEXT, sender TEXT, body TEXT)`);
+  runFts(`CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(subject, sender, body, content='bodies', content_rowid='id')`);
+  // Triggers to keep FTS in sync with bodies table
+  runFts(`CREATE TRIGGER IF NOT EXISTS bodies_ai AFTER INSERT ON bodies BEGIN INSERT INTO fts(rowid, subject, sender, body) VALUES (new.id, new.subject, new.sender, new.body); END`);
+  runFts(`CREATE TRIGGER IF NOT EXISTS bodies_ad AFTER DELETE ON bodies BEGIN INSERT INTO fts(fts, rowid, subject, sender, body) VALUES ('delete', old.id, old.subject, old.sender, old.body); END`);
+}
+
+function runFts(query) {
+  const q = query.replace(/\s+/g, " ").trim();
+  try {
+    return execSync(
+      `sqlite3 ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
+      { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
+    ).trim();
+  } catch (error) {
+    throw new Error(`FTS error: ${(error.message || "").slice(0, 200)}`);
+  }
+}
+
+function parseFts(query) {
+  const q = query.replace(/\s+/g, " ").trim();
+  try {
+    const raw = execSync(
+      `sqlite3 -json ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
+      { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
+    ).trim();
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+function isIndexed(emailId) {
+  const rows = parseFts(`SELECT 1 FROM indexed WHERE id = ${Number(emailId)} LIMIT 1`);
+  return rows.length > 0;
+}
+
+function indexEmail(emailId, subject, sender, bodyText) {
+  const id = Number(emailId);
+  if (isIndexed(id)) return;
+  // Truncate body to 50k chars to keep index size reasonable
+  const body = (bodyText || "").slice(0, 50000).replace(/'/g, "''");
+  const subj = (subject || "").replace(/'/g, "''");
+  const from = (sender || "").replace(/'/g, "''");
+  try {
+    runFts(`INSERT OR REPLACE INTO bodies (id, subject, sender, body) VALUES (${id}, '${subj}', '${from}', '${body}')`);
+    runFts(`INSERT OR REPLACE INTO indexed (id, ts) VALUES (${id}, ${Math.floor(Date.now() / 1000)})`);
+  } catch {}
+}
+
+// Background backfill: index unindexed messages in small batches
+let backfillRunning = false;
+function backfillBatch(batchSize = 20) {
+  if (backfillRunning) return;
+  backfillRunning = true;
+
+  try {
+    // Get the set of already-indexed IDs
+    const indexedRows = parseFts(`SELECT id FROM indexed`);
+    const indexedSet = new Set(indexedRows.map(r => r.id));
+
+    // Fetch recent messages from Envelope Index, newest first
+    const candidates = parseSqlite(`
+      SELECT m.ROWID as id FROM messages m
+      ORDER BY m.date_received DESC
+      LIMIT ${batchSize * 5}
+    `);
+
+    // Filter to ones not yet indexed
+    const unindexed = [];
+    for (const c of candidates) {
+      if (!indexedSet.has(c.id)) unindexed.push(c.id);
+      if (unindexed.length >= batchSize) break;
+    }
+
+    for (const id of unindexed) {
+      try {
+        const emlxPath = findEmlxPath(id);
+        if (!emlxPath) continue;
+        const data = parseEmlx(emlxPath);
+        indexEmail(id, data.subject, data.from, data.body);
+      } catch {}
+    }
+  } catch {} finally {
+    backfillRunning = false;
+  }
+}
+
+// Schedule periodic backfill (every 30s when server is running)
+let backfillTimer = null;
+function startBackfill() {
+  ensureFtsDb();
+  // Do an initial small batch immediately
+  setTimeout(() => backfillBatch(50), 5000);
+  // Then every 30s
+  backfillTimer = setInterval(() => backfillBatch(30), 30000);
+}
+
+function ftsIndexStats() {
+  try {
+    const indexed = parseFts(`SELECT COUNT(*) as n FROM indexed`);
+    const total = parseSqlite(`SELECT COUNT(*) as n FROM messages`);
+    return {
+      indexed: indexed[0]?.n || 0,
+      total: total[0]?.n || 0,
+    };
+  } catch {
+    return { indexed: 0, total: 0 };
+  }
+}
 
 function handleSearchEmails(args) {
   const query = args?.query || null;
   const mailboxName = args?.mailbox || "INBOX";
   const accountName = args?.account || null;
-  const limit = Math.min(args?.limit || 10, 50);
+  const limit = args?.limit || 10;
+  const sortDir = args?.sort === "asc" ? "ASC" : "DESC";
 
-  const queryStr = query ? escapeForJxa(query) : "null";
-  const mailboxStr = escapeForJxa(mailboxName);
-  const accountStr = accountName ? escapeForJxa(accountName) : "null";
+  // Resolve mailbox filter: match by last URL segment (URL-encoded in the DB)
+  const encodedMbox = encodeURIComponent(mailboxName).replace(/'/g, "''");
+  const escapedQuery = query ? query.replace(/'/g, "''") : "";
 
-  // Batch fetch is fast but still needs time for large mailboxes
-  const searchTimeout = query ? 60000 : 30000;
-  const data = parseJxa(`
-    const mail = Application("Mail");
-    const query = ${queryStr};
-    const mailboxName = ${mailboxStr};
-    const accountFilter = ${accountStr};
-    const limit = ${limit};
-
-    function getMailboxes() {
-      const accounts = mail.accounts();
-      const boxes = [];
-      for (const acct of accounts) {
-        if (accountFilter && acct.name() !== accountFilter) continue;
-        const mboxes = acct.mailboxes();
-        for (const box of mboxes) {
-          try {
-            if (box.name() === mailboxName) {
-              boxes.push({box: box, account: acct.name()});
-            }
-          } catch(e) {}
-        }
-      }
-      return boxes;
+  // Account filter: resolve name to UUID if provided
+  let accountUuidFilter = null;
+  if (accountName) {
+    const names = getAccountNames();
+    for (const [uuid, name] of Object.entries(names)) {
+      if (name === accountName) { accountUuidFilter = uuid; break; }
     }
+  }
 
-    const mailboxes = getMailboxes();
-    const results = [];
+  const accountClauseLabel = accountUuidFilter
+    ? `AND mb_label.url LIKE '%${accountUuidFilter}%'`
+    : "";
+  const accountClauseDirect = accountUuidFilter
+    ? `AND mb.url LIKE '%${accountUuidFilter}%'`
+    : "";
 
-    for (const {box, account} of mailboxes) {
-      let msgs;
-      try {
-        msgs = box.messages;
-      } catch(e) { continue; }
+  // Messages live in the "source" mailbox (e.g. All Mail for Gmail).
+  // The labels table maps them to virtual mailboxes (INBOX, Sent, etc.).
+  // For source mailboxes (Spam, Trash, Drafts) messages are stored directly.
+  const searchClause = query
+    ? `AND (s.subject LIKE '%${escapedQuery}%' OR a.address LIKE '%${escapedQuery}%' OR a.comment LIKE '%${escapedQuery}%')`
+    : "";
+  const unreadClause = args?.unread_only ? "AND m.read = 0" : "";
 
-      const mboxName = box.name();
+  // Date filters: Envelope Index stores date_received as Unix timestamp (seconds)
+  let dateClause = "";
+  if (args?.after) {
+    const ts = Math.floor(new Date(args.after).getTime() / 1000);
+    if (!isNaN(ts)) dateClause += ` AND m.date_received >= ${ts}`;
+  }
+  if (args?.before) {
+    const ts = Math.floor(new Date(args.before + "T23:59:59").getTime() / 1000);
+    if (!isNaN(ts)) dateClause += ` AND m.date_received <= ${ts}`;
+  }
 
-      if (query) {
-        // Search mode: batch fetch subjects + senders, filter, then get details for matches
-        let subjects, senders, ids;
-        try {
-          ids = msgs.id();
-          subjects = msgs.subject();
-          senders = msgs.sender();
-        } catch(e) { continue; }
-        const q = query.toLowerCase();
-        const matchIdx = [];
-        for (let i = 0; i < ids.length; i++) {
-          const s = (subjects[i] || "").toLowerCase();
-          const f = (senders[i] || "").toLowerCase();
-          if (s.includes(q) || f.includes(q)) matchIdx.push(i);
-        }
-        // Fetch dates + flags only for matches
-        let dates, readArr, flaggedArr;
-        try {
-          dates = msgs.dateReceived();
-          readArr = msgs.readStatus();
-          flaggedArr = msgs.flaggedStatus();
-        } catch(e) { continue; }
-        for (const i of matchIdx) {
-          results.push({
-            id: ids[i],
-            subject: subjects[i] || "(no subject)",
-            from: senders[i] || "",
-            date: dates[i] ? dates[i].toISOString() : "",
-            read: readArr[i],
-            flagged: flaggedArr[i],
-            mailbox: mboxName,
-            account: account
-          });
-        }
-      } else {
-        // Recent mode: batch fetch dates + ids, sort, take top N, then get details
-        let ids, dates;
-        try {
-          ids = msgs.id();
-          dates = msgs.dateReceived();
-        } catch(e) { continue; }
-        // Build index pairs and sort by date descending
-        const indexed = [];
-        for (let i = 0; i < ids.length; i++) {
-          indexed.push({i: i, date: dates[i] ? dates[i].getTime() : 0});
-        }
-        indexed.sort((a, b) => b.date - a.date);
-        const topN = indexed.slice(0, limit);
-        // Fetch remaining props for just these indices
-        let subjects, senders, readArr, flaggedArr;
-        try {
-          subjects = msgs.subject();
-          senders = msgs.sender();
-          readArr = msgs.readStatus();
-          flaggedArr = msgs.flaggedStatus();
-        } catch(e) { continue; }
-        for (const {i, date} of topN) {
-          results.push({
-            id: ids[i],
-            subject: subjects[i] || "(no subject)",
-            from: senders[i] || "",
-            date: dates[i] ? dates[i].toISOString() : "",
-            read: readArr[i],
-            flagged: flaggedArr[i],
-            mailbox: mboxName,
-            account: account
-          });
-        }
-      }
-    }
-    // Final sort across all mailboxes
-    results.sort((a, b) => b.date.localeCompare(a.date));
-    JSON.stringify(results.slice(0, limit));
-  `, { timeout: searchTimeout });
+  const sql = `
+    SELECT m.ROWID as id, COALESCE(m.subject_prefix, '') || s.subject as subject, a.address as sender_addr, a.comment as sender_name,
+           m.date_received, m.read, m.flagged, mb_label.url as mailbox_url
+    FROM messages m
+    JOIN labels l ON l.message_id = m.ROWID
+    JOIN mailboxes mb_label ON mb_label.ROWID = l.mailbox_id
+    JOIN subjects s ON s.ROWID = m.subject
+    JOIN addresses a ON a.ROWID = m.sender
+    WHERE mb_label.url LIKE '%/${encodedMbox}'
+      ${accountClauseLabel}
+      ${searchClause}
+      ${unreadClause}
+      ${dateClause}
+    ORDER BY m.date_received ${sortDir}
+    LIMIT ${limit};
+  `;
+
+  let data;
+  try {
+    data = parseSqlite(sql);
+  } catch (e) {
+    data = [];
+  }
+
+  if (!data || data.length === 0) {
+    // Try direct mailbox match (for Spam, Trash, Drafts which store messages directly)
+    const directSql = `
+      SELECT m.ROWID as id, COALESCE(m.subject_prefix, '') || s.subject as subject, a.address as sender_addr, a.comment as sender_name,
+             m.date_received, m.read, m.flagged, mb.url as mailbox_url
+      FROM messages m
+      JOIN mailboxes mb ON mb.ROWID = m.mailbox
+      JOIN subjects s ON s.ROWID = m.subject
+      JOIN addresses a ON a.ROWID = m.sender
+      WHERE mb.url LIKE '%/${encodedMbox}'
+        ${accountClauseDirect}
+        ${searchClause}
+        ${unreadClause}
+        ${dateClause}
+      ORDER BY m.date_received ${sortDir}
+      LIMIT ${limit};
+    `;
+    data = parseSqlite(directSql);
+  }
 
   if (!data || data.length === 0) {
     return ok(query ? `No emails matching "${query}".` : "No emails found.");
   }
 
-  const lines = data.map(
-    (e) =>
-      `ID:${e.id} | ${e.read ? " " : "●"} ${e.flagged ? "⚑ " : ""}${e.date.slice(0, 10)} | ${e.from} | ${e.subject} [${e.account}/${e.mailbox}]`
-  );
+  const lines = data.map((e) => {
+    const date = e.date_received
+      ? new Date(e.date_received * 1000).toISOString().slice(0, 10)
+      : "";
+    const from = e.sender_name && e.sender_addr
+      ? `${e.sender_name} <${e.sender_addr}>`
+      : e.sender_name || e.sender_addr || "";
+    const account = accountFromUrl(e.mailbox_url || "");
+    const mailbox = mailboxFromUrl(e.mailbox_url || "");
+    return `ID:${e.id} | ${e.read ? " " : "●"} ${e.flagged ? "⚑ " : ""}${date} | ${from} | ${e.subject || "(no subject)"} [${account}/${mailbox}]`;
+  });
   return ok(lines.join("\n"));
 }
 
@@ -494,42 +1023,75 @@ function handleGetEmail(args) {
   const emailId = args?.email_id;
   if (!emailId) return err("email_id is required.");
 
+  // Try direct .emlx file read first (~1ms vs ~3s JXA)
+  const emlxPath = findEmlxPath(emailId);
+  if (emlxPath) {
+    try {
+      const data = parseEmlx(emlxPath);
+      // Get read/flagged status from SQLite
+      const meta = parseSqlite(`SELECT read, flagged FROM messages WHERE ROWID = ${Number(emailId)}`);
+      const isRead = meta.length > 0 ? !!meta[0].read : false;
+      const isFlagged = meta.length > 0 ? !!meta[0].flagged : false;
+
+      const body = cleanBody(data.body);
+
+      // Index body text for FTS5 search (fire-and-forget)
+      try { indexEmail(emailId, data.subject, data.from, data.body); } catch {}
+
+      const parts = [
+        `Subject: ${data.subject || "(no subject)"}`,
+        `From: ${data.from}`,
+        `To: ${data.to}`,
+      ];
+      if (data.cc) parts.push(`CC: ${data.cc}`);
+      parts.push(`Date: ${data.date}`);
+      parts.push(`Read: ${isRead} | Flagged: ${isFlagged}`);
+      parts.push("");
+      parts.push(body);
+      return ok(parts.join("\n"));
+    } catch (e) {
+      console.error(`emlx parse failed for ${emailId}: ${e.message}`);
+      // Fall through to JXA
+    }
+  }
+
+  // JXA fallback if .emlx not found or parse failed
+  const loc = findMessageLocation(emailId);
+  if (!loc) return err(`Email ${emailId} not found.`);
+
   const data = parseJxa(`
     const mail = Application("Mail");
     const msgId = ${Number(emailId)};
     let found = null;
-
-    const accounts = mail.accounts();
-    outer:
-    for (const acct of accounts) {
-      const boxes = acct.mailboxes();
-      for (const box of boxes) {
-        try {
-          const msgs = box.messages.whose({id: msgId})();
-          if (msgs.length > 0) {
-            const m = msgs[0];
-            found = {
-              id: m.id(),
-              subject: m.subject() || "(no subject)",
-              from: m.sender() || "",
-              to: m.toRecipients().map(r => { try { return r.address() } catch(e) { return "" } }).filter(Boolean).join(", "),
-              cc: m.ccRecipients().map(r => { try { return r.address() } catch(e) { return "" } }).filter(Boolean).join(", "),
-              date: m.dateReceived().toISOString(),
-              read: m.readStatus(),
-              flagged: m.flaggedStatus(),
-              body: m.content() || ""
-            };
-            break outer;
-          }
-        } catch(e) {}
+    try {
+      const acct = mail.accounts.whose({name: ${escapeForJxa(loc.account)}})()[0];
+      const box = acct.mailboxes.whose({name: ${escapeForJxa(loc.mailbox)}})()[0];
+      const msgs = box.messages.whose({id: msgId})();
+      if (msgs.length > 0) {
+        const m = msgs[0];
+        found = {
+          id: m.id(),
+          subject: m.subject() || "(no subject)",
+          from: m.sender() || "",
+          to: m.toRecipients().map(r => { try { return r.address() } catch(e) { return "" } }).filter(Boolean).join(", "),
+          cc: m.ccRecipients().map(r => { try { return r.address() } catch(e) { return "" } }).filter(Boolean).join(", "),
+          date: m.dateReceived().toISOString(),
+          read: m.readStatus(),
+          flagged: m.flaggedStatus(),
+          body: m.content() || ""
+        };
       }
-    }
+    } catch(e) {}
     JSON.stringify(found);
   `);
 
   if (!data) return err(`Email ${emailId} not found.`);
 
   const body = cleanBody(data.body);
+
+  // Index body text for FTS5 search (fire-and-forget)
+  try { indexEmail(emailId, data.subject, data.from, data.body); } catch {}
+
   const parts = [
     `Subject: ${data.subject}`,
     `From: ${data.from}`,
@@ -542,6 +1104,67 @@ function handleGetEmail(args) {
   parts.push(body);
 
   return ok(parts.join("\n"));
+}
+
+// --- search_body ---
+
+function handleSearchBody(args) {
+  const query = args?.query;
+  if (!query) return err("query is required.");
+  const limit = args?.limit || 20;
+
+  const escapedQuery = query.replace(/'/g, "''").replace(/"/g, '""');
+
+  // FTS5 MATCH query with BM25 ranking
+  const results = parseFts(`
+    SELECT b.id, b.subject, b.sender, snippet(fts, 2, '>>>', '<<<', '...', 40) as snippet,
+           rank
+    FROM fts
+    JOIN bodies b ON b.id = fts.rowid
+    WHERE fts MATCH '"${escapedQuery}"'
+    ORDER BY rank
+    LIMIT ${limit}
+  `);
+
+  if (!results || results.length === 0) {
+    // Also try unquoted for multi-word queries
+    const results2 = parseFts(`
+      SELECT b.id, b.subject, b.sender, snippet(fts, 2, '>>>', '<<<', '...', 40) as snippet,
+             rank
+      FROM fts
+      JOIN bodies b ON b.id = fts.rowid
+      WHERE fts MATCH '${escapedQuery}'
+      ORDER BY rank
+      LIMIT ${limit}
+    `);
+    if (!results2 || results2.length === 0) {
+      const stats = ftsIndexStats();
+      return ok(`No results for "${query}". Index: ${stats.indexed}/${stats.total} emails indexed.`);
+    }
+    return formatBodyResults(results2, query);
+  }
+  return formatBodyResults(results, query);
+}
+
+function formatBodyResults(results, query) {
+  const stats = ftsIndexStats();
+  // Get dates from Envelope Index for these message IDs
+  const ids = results.map(r => r.id).join(",");
+  let dateMap = {};
+  try {
+    const dates = parseSqlite(`SELECT ROWID as id, date_received FROM messages WHERE ROWID IN (${ids})`);
+    for (const d of dates) dateMap[d.id] = d.date_received;
+  } catch {}
+
+  const lines = results.map(r => {
+    const date = dateMap[r.id]
+      ? new Date(dateMap[r.id] * 1000).toISOString().slice(0, 10)
+      : "";
+    const snippet = (r.snippet || "").replace(/\n/g, " ").trim();
+    return `ID:${r.id} | ${date} | ${r.sender || ""} | ${r.subject || "(no subject)"}\n  ${snippet}`;
+  });
+  lines.push(`\nIndex: ${stats.indexed}/${stats.total} emails indexed`);
+  return ok(lines.join("\n"));
 }
 
 // --- compose ---
@@ -649,7 +1272,6 @@ function handleMoveEmail(args) {
 
   if (!emailId || !destination) return err("email_id and destination required.");
 
-  // Fast lookup via JXA
   const loc = findMessageLocation(emailId);
   if (!loc) return err(`Email ${emailId} not found.`);
 
@@ -674,6 +1296,59 @@ end tell`;
   return ok(result);
 }
 
+// --- archive_emails ---
+
+function handleArchiveEmails(args) {
+  const emailIds = args?.email_ids;
+  if (!emailIds || emailIds.length === 0) return err("email_ids required.");
+
+  // Find which account/mailbox each message is in via SQLite
+  const byMailbox = {};
+  const notFound = [];
+  for (const id of emailIds) {
+    const loc = findMessageLocation(Number(id));
+    if (!loc) {
+      notFound.push(id);
+      continue;
+    }
+    const key = `${loc.account}|||${loc.mailbox}`;
+    if (!byMailbox[key]) byMailbox[key] = { account: loc.account, mailbox: loc.mailbox, ids: [] };
+    byMailbox[key].ids.push(Number(id));
+  }
+
+  let archived = 0;
+  const errors = [];
+
+  for (const { account, mailbox, ids } of Object.values(byMailbox)) {
+    // Build AppleScript ID list
+    const idList = ids.join(", ");
+    const script = `tell application "Mail"
+    set theBox to mailbox "${escapeForAppleScript(mailbox)}" of account "${escapeForAppleScript(account)}"
+    set archived to 0
+    repeat with msgId in {${idList}}
+        set msgs to (every message of theBox whose id is msgId)
+        if (count of msgs) > 0 then
+            delete item 1 of msgs
+            set archived to archived + 1
+        end if
+    end repeat
+    return archived
+end tell`;
+
+    try {
+      const count = parseInt(runAppleScript(script, { timeout: 120000 }), 10) || 0;
+      archived += count;
+    } catch (e) {
+      errors.push(`${account}/${mailbox}: ${e.message}`);
+    }
+  }
+
+  const parts = [`Archived ${archived} of ${emailIds.length} emails.`];
+  if (notFound.length > 0) parts.push(`Not found: ${notFound.join(", ")}`);
+  if (errors.length > 0) parts.push(`Errors: ${errors.join("; ")}`);
+  return ok(parts.join("\n"));
+}
+
 // --- Exports for testing ---
 export {
   stripSignature,
@@ -682,6 +1357,14 @@ export {
   markdownToHtml,
   escapeForAppleScript,
   escapeForJxa,
+  decodeMimeWords,
+  decodeQuotedPrintable,
+  htmlToText,
+  extractTextFromMultipart,
+  parseEmlx,
+  accountUuidFromUrl,
+  mailboxFromUrl,
+  mboxPathFromUrl,
 };
 
 // --- Start server ---
@@ -692,4 +1375,10 @@ async function main() {
   console.error("mcp-apple-mail running on stdio");
 }
 
-main().catch(console.error);
+// Only run server + warm caches when executed directly, not when imported for testing
+const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^\//, ""));
+if (isDirectRun) {
+  warmCaches();
+  startBackfill();
+  main().catch(console.error);
+}
