@@ -140,7 +140,7 @@ function markdownToHtml(text) {
   html = html.replace(/(<\/h[1-3]>)<\/p>/g, "$1");
   html = html.replace(/<p>(<ul>)/g, "$1");
   html = html.replace(/(<\/ul>)<\/p>/g, "$1");
-  return `<div style="font-family: Helvetica, -apple-system, sans-serif; font-size: 12px;">${html}</div>`;
+  return `<div style="font-family: Helvetica, -apple-system, sans-serif;">${html}</div>`;
 }
 
 // --- AppleScript for write ops (JXA's Mail.app write support is flaky) ---
