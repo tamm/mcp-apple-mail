@@ -353,6 +353,16 @@ const TOOLS = [
     },
   },
   {
+    name: "index_now",
+    description: "Accelerate or reset the background FTS5 indexing speed. Use when you need complete search results soon.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        turbo: { type: "boolean", description: "true = index flat out (~flat out, CPU-bound). false = reset to normal background rate." },
+      },
+    },
+  },
+  {
     name: "search_body",
     description: "Full-text body search using FTS5 index. Index builds incrementally as emails are read. Returns relevance-ranked results.",
     inputSchema: {
@@ -390,6 +400,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = handleMoveEmail(args); break;
       case "archive_emails":
         result = handleArchiveEmails(args); break;
+      case "index_now":
+        result = handleIndexNow(args); break;
       case "search_body":
         result = handleSearchBody(args); break;
       default:
@@ -930,6 +942,35 @@ function drainOne() {
 }
 
 let drainTimer = null;
+let drainInterval = 100; // ms, adjusted by index_now
+
+function setDrainInterval(ms) {
+  drainInterval = ms;
+  if (!drainTimer) return;
+  clearInterval(drainTimer);
+  if (ms === 0) {
+    // Turbo: tight loop via setImmediate, yields to I/O between each email
+    const loop = () => { drainOne(); if (drainInterval === 0) setImmediate(loop); else drainTimer = setInterval(drainOne, drainInterval); };
+    setImmediate(loop);
+    drainTimer = true; // sentinel so we know we're running
+  } else {
+    drainTimer = setInterval(drainOne, ms);
+  }
+}
+
+function handleIndexNow(args) {
+  const turbo = args?.turbo !== false; // default true
+  if (turbo) {
+    setDrainInterval(0);
+    const stats = ftsIndexStats();
+    return ok(`Turbo indexing on. ${ftsStatusLine(stats)}`);
+  } else {
+    setDrainInterval(100);
+    const stats = ftsIndexStats();
+    return ok(`Indexing reset to normal rate. ${ftsStatusLine(stats)}`);
+  }
+}
+
 function startBackfill() {
   ensureFtsDb();
   ensureQueue();
@@ -937,8 +978,8 @@ function startBackfill() {
   setTimeout(() => {
     seedQueue();
     drainOne();
-    // 500ms per email = ~7200/hr, gentle but not glacial
-    drainTimer = setInterval(drainOne, 500);
+    // 100ms per email = ~36,000/hr background trickle; call index_now for turbo
+    drainTimer = setInterval(drainOne, drainInterval);
   }, 3000);
 }
 
