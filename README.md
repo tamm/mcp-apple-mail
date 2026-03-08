@@ -71,7 +71,7 @@ Or add to `.mcp.json` in your project:
 
 **Lean by design.** MCP tool descriptions and response payloads are kept minimal. Every token in a tool definition or result costs context window budget in the calling LLM. Short descriptions, compact one-line result formats, no unnecessary metadata.
 
-**SQLite + emlx for reads.** `search_emails_fast` queries Mail.app's `Envelope Index` SQLite database directly. `get_email` reads `.emlx` files from disk. SQLite ROWIDs match JXA's `message.id()`, so IDs are interchangeable between fast and slow paths.
+**SQLite + emlx for reads.** `search_emails` queries Mail.app's `Envelope Index` SQLite database directly. `get_email` reads `.emlx` files from disk. SQLite ROWIDs match JXA's `message.id()`, so IDs are interchangeable between fast and slow paths.
 
 **JXA batch fetch as fallback.** `search_emails` uses JXA batch property access (`msgs.subject()` returns all subjects in one IPC call) instead of per-message iteration. Results are sorted by date descending in JS to handle Gmail IMAP's unreliable message ordering.
 
