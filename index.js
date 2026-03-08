@@ -931,55 +931,60 @@ function drainOne() {
         const data = parseEmlx(emlxPath);
         indexEmail(id, data.subject, data.from, data.body);
       }
-      // Mark done whether we indexed or not (missing file = skip permanently)
       markQueueDone(id);
     } catch {
-      markQueueDone(id); // Don't retry broken emails
+      markQueueDone(id);
     }
+    // Recalculate interval after each item — queue is shrinking
+    if (!turboMode) reschedule();
   } catch {} finally {
     drainBusy = false;
   }
 }
 
 let drainTimer = null;
-let drainInterval = 100; // ms, adjusted by index_now
+let turboMode = false;
 
-function setDrainInterval(ms) {
-  drainInterval = ms;
-  if (!drainTimer) return;
-  clearInterval(drainTimer);
-  if (ms === 0) {
-    // Turbo: tight loop via setImmediate, yields to I/O between each email
-    const loop = () => { drainOne(); if (drainInterval === 0) setImmediate(loop); else drainTimer = setInterval(drainOne, drainInterval); };
+function normalInterval() {
+  // Aim to drain the pending queue in ~1 hour
+  const pending = parseFts(`SELECT COUNT(*) as n FROM queue WHERE status = 'pending'`);
+  const n = pending[0]?.n || 0;
+  if (n === 0) return 5000; // idle — check every 5s for new mail
+  // clamp: at least 10ms (not hammering), at most 5s (not glacial)
+  return Math.min(5000, Math.max(10, Math.floor(3600000 / n)));
+}
+
+function reschedule() {
+  if (turboMode) return; // turbo loop manages itself
+  if (drainTimer) clearInterval(drainTimer);
+  drainTimer = setInterval(drainOne, normalInterval());
+}
+
+function setTurbo(on) {
+  turboMode = on;
+  if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
+  if (on) {
+    const loop = () => { drainOne(); if (turboMode) setImmediate(loop); else reschedule(); };
     setImmediate(loop);
-    drainTimer = true; // sentinel so we know we're running
   } else {
-    drainTimer = setInterval(drainOne, ms);
+    reschedule();
   }
 }
 
 function handleIndexNow(args) {
-  const turbo = args?.turbo !== false; // default true
-  if (turbo) {
-    setDrainInterval(0);
-    const stats = ftsIndexStats();
-    return ok(`Turbo indexing on. ${ftsStatusLine(stats)}`);
-  } else {
-    setDrainInterval(100);
-    const stats = ftsIndexStats();
-    return ok(`Indexing reset to normal rate. ${ftsStatusLine(stats)}`);
-  }
+  const turbo = args?.turbo !== false;
+  setTurbo(turbo);
+  const stats = ftsIndexStats();
+  const mode = turbo ? "Turbo indexing on (no delay)." : "Indexing reset to normal rate (targeting 1hr completion).";
+  return ok(`${mode} ${ftsStatusLine(stats)}`);
 }
 
 function startBackfill() {
   ensureFtsDb();
   ensureQueue();
-  // Seed queue after a short delay so server starts fast
   setTimeout(() => {
     seedQueue();
-    drainOne();
-    // 100ms per email = ~36,000/hr background trickle; call index_now for turbo
-    drainTimer = setInterval(drainOne, drainInterval);
+    reschedule(); // sets initial interval based on queue size, then drains
   }, 3000);
 }
 
