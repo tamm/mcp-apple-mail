@@ -9,6 +9,7 @@
     "bench": "node test/benchmark.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.1"
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "marked": "^17.0.4"
   }
 }

@@ -5,8 +5,14 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execSync, exec } from "child_process";
-import { readFileSync, accessSync, readdirSync, existsSync, mkdirSync, constants as fsConst } from "fs";
+import { marked } from "marked";
+import { readFileSync, writeFileSync, unlinkSync, accessSync, readdirSync, existsSync, mkdirSync, statSync, constants as fsConst } from "fs";
 import { join } from "path";
+
+const SEND_CONFIG_PATH = join(process.env.HOME || "", ".mcp-apple-mail", "send-config.json");
+const SEND_TIMESTAMP_PATH = join(process.env.HOME || "", ".mcp-apple-mail", "last-send-ts");
+const SEND_MIN_INTERVAL_FLOOR = 120; // seconds — hardcoded, config can only increase
+const SEND_MAX_RECIPIENTS = 1;
 
 const server = new Server(
   { name: "mcp-apple-mail", version: "1.0.0" },
@@ -116,32 +122,7 @@ function cleanBody(text) {
 // --- Markdown to HTML ---
 
 function markdownToHtml(text) {
-  let html = text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
-  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-  html = html.replace(/(?<!\w)_(.+?)_(?!\w)/g, "<em>$1</em>");
-  html = html.replace(/`(.+?)`/g, "<code>$1</code>");
-  html = html.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
-  html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
-  html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
-  html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
-  html = html.replace(/^[\-\*] (.+)$/gm, "<li>$1</li>");
-  html = html.replace(/^\d+\. (.+)$/gm, "<li>$1</li>");
-  html = html.replace(/((?:<li>.*<\/li>(?:\n|$))+)/g, (match) => {
-    return "<ul>" + match.trim().replace(/\n/g, "") + "</ul>";
-  });
-  html = html.replace(/\n\n+/g, "</p><p>");
-  html = html.replace(/\n/g, "<br>");
-  html = "<p>" + html + "</p>";
-  html = html.replace(/<p><\/p>/g, "");
-  html = html.replace(/<p>(<h[1-3]>)/g, "$1");
-  html = html.replace(/(<\/h[1-3]>)<\/p>/g, "$1");
-  html = html.replace(/<p>(<ul>)/g, "$1");
-  html = html.replace(/(<\/ul>)<\/p>/g, "$1");
+  const html = marked.parse(text, { async: false });
   return `<div style="font-family: Helvetica, -apple-system, sans-serif;">${html}</div>`;
 }
 
@@ -265,6 +246,36 @@ function escapeForJxa(str) {
   return JSON.stringify(str);
 }
 
+// --- Send config loader (cached, stat-invalidated) ---
+
+let _sendConfigCache = null;
+let _sendConfigMtime = 0;
+
+function loadSendConfig() {
+  try {
+    if (!existsSync(SEND_CONFIG_PATH)) { _sendConfigCache = null; return null; }
+    const mt = statSync(SEND_CONFIG_PATH).mtimeMs;
+    if (_sendConfigCache && mt === _sendConfigMtime) return _sendConfigCache;
+    const raw = readFileSync(SEND_CONFIG_PATH, "utf-8");
+    const config = JSON.parse(raw);
+    if (config.enabled !== true) { _sendConfigCache = null; return null; }
+    if (!config.from_account || typeof config.from_account !== "string") { _sendConfigCache = null; return null; }
+    if (!config.from_email || typeof config.from_email !== "string") { _sendConfigCache = null; return null; }
+    if (!Array.isArray(config.allowed_recipients) || config.allowed_recipients.length === 0) { _sendConfigCache = null; return null; }
+    _sendConfigMtime = mt;
+    _sendConfigCache = {
+      from_account: config.from_account,
+      from_email: config.from_email.toLowerCase().trim(),
+      allowed_recipients: config.allowed_recipients.map(r => r.toLowerCase().trim()),
+      min_interval_seconds: Math.max(SEND_MIN_INTERVAL_FLOOR, Number(config.min_interval_seconds) || SEND_MIN_INTERVAL_FLOOR),
+    };
+    return _sendConfigCache;
+  } catch {
+    _sendConfigCache = null;
+    return null;
+  }
+}
+
 // --- Tool definitions ---
 
 const TOOLS = [
@@ -354,13 +365,8 @@ const TOOLS = [
   },
   {
     name: "index_now",
-    description: "Accelerate or reset the background FTS5 indexing speed. Use when you need complete search results soon.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        turbo: { type: "boolean", description: "true = index flat out (~flat out, CPU-bound). false = reset to normal background rate." },
-      },
-    },
+    description: "Trigger a full FTS5 index pass immediately. Use before search_body when you need complete results.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "search_body",
@@ -378,9 +384,26 @@ const TOOLS = [
 
 // --- Tool handlers ---
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const tools = [...TOOLS];
+  if (loadSendConfig()) {
+    tools.push({
+      name: "send_email",
+      description: "Send an email (restricted: allowlisted recipients only, rate limited). Only available when send config is active.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "Recipient email (must be in allowlist)." },
+          subject: { type: "string", description: "Email subject." },
+          body: { type: "string", description: "Email body (markdown, converted to HTML)." },
+          dry_run: { type: "boolean", description: "If true, opens a draft instead of sending. For testing." },
+        },
+        required: ["to", "subject", "body"],
+      },
+    });
+  }
+  return { tools };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -404,6 +427,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = handleIndexNow(args); break;
       case "search_body":
         result = handleSearchBody(args); break;
+      case "send_email":
+        result = handleSendEmail(args); break;
       default:
         return err(`Unknown tool: ${name}`);
     }
@@ -860,132 +885,39 @@ function indexEmail(emailId, subject, sender, bodyText) {
   } catch {}
 }
 
-// --- Background indexing queue ---
-//
-// Strategy: seed a queue table with all known message IDs (newest-first priority),
-// then drain it one email per tick. New emails are detected each tick and enqueued.
-// Passive get_email calls mark items done immediately, so hot emails are always indexed.
-// Resilient: skips missing .emlx files, resumes across restarts, never blocks the server.
+// --- Background indexing ---
+// Reads all unindexed .emlx files in a setImmediate loop — fast (SSD reads, no JXA),
+// yields between each email so the server stays responsive. Polls every 30s for new mail.
 
-function ensureQueue() {
-  runFts(`CREATE TABLE IF NOT EXISTS queue (
-    id INTEGER PRIMARY KEY,
-    priority INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'pending'
-  )`);
-  runFts(`CREATE INDEX IF NOT EXISTS queue_status ON queue(status, priority DESC)`);
-}
-
-function seedQueue() {
-  // Only seed if queue is completely empty (first run or wiped)
-  const existing = parseFts(`SELECT COUNT(*) as n FROM queue`);
-  if ((existing[0]?.n || 0) > 0) return;
-
+function runIndexPass() {
   try {
-    const ids = parseSqlite(`SELECT ROWID as id, date_received FROM messages ORDER BY date_received DESC`);
-    if (!ids.length) return;
-
-    // Batch insert in chunks of 500 to avoid huge SQL strings
-    const CHUNK = 500;
-    for (let i = 0; i < ids.length; i += CHUNK) {
-      const chunk = ids.slice(i, i + CHUNK);
-      const vals = chunk.map((r, j) => `(${r.id}, ${ids.length - i - j})`).join(",");
-      runFts(`INSERT OR IGNORE INTO queue (id, priority) VALUES ${vals}`);
+    const unindexed = parseSqlite(`
+      SELECT m.ROWID as id FROM messages m
+      LEFT JOIN (SELECT id FROM indexed) i ON i.id = m.ROWID
+      WHERE i.id IS NULL
+      ORDER BY m.date_received DESC
+    `);
+    for (const { id } of unindexed) {
+      try {
+        const emlxPath = findEmlxPath(id);
+        if (emlxPath) {
+          const data = parseEmlx(emlxPath);
+          indexEmail(id, data.subject, data.from, data.body);
+        }
+      } catch {}
     }
   } catch {}
 }
 
-function enqueueNewEmails() {
-  // Find IDs above our current max queue ID — these are emails that arrived since last seed
-  try {
-    const maxKnown = parseFts(`SELECT MAX(id) as m FROM queue`);
-    const since = maxKnown[0]?.m || 0;
-    if (!since) return;
-    const newIds = parseSqlite(`SELECT ROWID as id FROM messages WHERE ROWID > ${since} ORDER BY ROWID ASC`);
-    if (!newIds.length) return;
-    const vals = newIds.map(r => `(${r.id}, 999999, 'pending')`).join(",");
-    runFts(`INSERT OR IGNORE INTO queue (id, priority, status) VALUES ${vals}`);
-  } catch {}
-}
-
-function markQueueDone(id) {
-  try { runFts(`UPDATE queue SET status = 'done' WHERE id = ${Number(id)}`); } catch {}
-}
-
-let drainBusy = false;
-
-function drainOne() {
-  if (drainBusy) return;
-  drainBusy = true;
-  try {
-    // Check for new emails each tick (cheap — only looks at IDs above our max known)
-    enqueueNewEmails();
-
-    const rows = parseFts(`SELECT id FROM queue WHERE status = 'pending' ORDER BY priority DESC LIMIT 1`);
-    if (!rows.length) return;
-
-    const id = rows[0].id;
-    try {
-      const emlxPath = findEmlxPath(id);
-      if (emlxPath) {
-        const data = parseEmlx(emlxPath);
-        indexEmail(id, data.subject, data.from, data.body);
-      }
-      markQueueDone(id);
-    } catch {
-      markQueueDone(id);
-    }
-    // Recalculate interval after each item — queue is shrinking
-    if (!turboMode) reschedule();
-  } catch {} finally {
-    drainBusy = false;
-  }
-}
-
-let drainTimer = null;
-let turboMode = false;
-
-function normalInterval() {
-  // Aim to drain the pending queue in ~1 hour
-  const pending = parseFts(`SELECT COUNT(*) as n FROM queue WHERE status = 'pending'`);
-  const n = pending[0]?.n || 0;
-  if (n === 0) return 5000; // idle — check every 5s for new mail
-  // clamp: at least 10ms (not hammering), at most 5s (not glacial)
-  return Math.min(5000, Math.max(10, Math.floor(3600000 / n)));
-}
-
-function reschedule() {
-  if (turboMode) return; // turbo loop manages itself
-  if (drainTimer) clearInterval(drainTimer);
-  drainTimer = setInterval(drainOne, normalInterval());
-}
-
-function setTurbo(on) {
-  turboMode = on;
-  if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
-  if (on) {
-    const loop = () => { drainOne(); if (turboMode) setImmediate(loop); else reschedule(); };
-    setImmediate(loop);
-  } else {
-    reschedule();
-  }
-}
-
-function handleIndexNow(args) {
-  const turbo = args?.turbo !== false;
-  setTurbo(turbo);
+function handleIndexNow(_args) {
+  runIndexPass();
   const stats = ftsIndexStats();
-  const mode = turbo ? "Turbo indexing on (no delay)." : "Indexing reset to normal rate (targeting 1hr completion).";
-  return ok(`${mode} ${ftsStatusLine(stats)}`);
+  return ok(`Index pass complete. ${ftsStatusLine(stats)}`);
 }
 
 function startBackfill() {
   ensureFtsDb();
-  ensureQueue();
-  setTimeout(() => {
-    seedQueue();
-    reschedule(); // sets initial interval based on queue size, then drains
-  }, 3000);
+  runIndexPass();
 }
 
 function ftsIndexStats() {
@@ -1138,7 +1070,7 @@ function handleGetEmail(args) {
       const body = cleanBody(data.body);
 
       // Index body text for FTS5 search (fire-and-forget)
-      try { indexEmail(emailId, data.subject, data.from, data.body); markQueueDone(emailId); } catch {}
+      try { indexEmail(emailId, data.subject, data.from, data.body); } catch {}
 
       const parts = [
         `Subject: ${data.subject || "(no subject)"}`,
@@ -1192,7 +1124,7 @@ function handleGetEmail(args) {
   const body = cleanBody(data.body);
 
   // Index body text for FTS5 search (fire-and-forget)
-  try { indexEmail(emailId, data.subject, data.from, data.body); markQueueDone(emailId); } catch {}
+  try { indexEmail(emailId, data.subject, data.from, data.body); } catch {}
 
   const parts = [
     `Subject: ${data.subject}`,
@@ -1271,33 +1203,16 @@ function formatBodyResults(results, query) {
 
 // --- compose ---
 
-// Paste HTML body into Mail.app compose window via clipboard
-// Mail.app body is a WebView: window > group 1 > group 1 > scroll area 1
-function pasteHtmlBody(htmlBody) {
-  execSync(
-    `echo ${JSON.stringify(htmlBody)} | textutil -stdin -format html -inputencoding UTF-8 -convert rtf -stdout | pbcopy`,
-    { shell: "/bin/bash", timeout: 10000 }
+// Write HTML body to a temp RTF file, set it on the message, then delete the file.
+// Returns the AppleScript snippet to embed (reads from tmpPath).
+function setRtfBody(htmlBody, msgVar = "newMsg") {
+  const rtfPath = `/tmp/mcp-mail-body-${Date.now()}.rtf`;
+  const rtf = execSync(
+    `textutil -stdin -format html -inputencoding UTF-8 -convert rtf -stdout`,
+    { input: Buffer.from(htmlBody, "utf8"), timeout: 10000 }
   );
-  runAppleScript(`tell application "Mail"
-    activate
-end tell
-delay 0.3
-tell application "System Events"
-    tell process "Mail"
-        tell front window
-            tell group 1
-                tell group 1
-                    tell scroll area 1
-                        set focused to true
-                        click
-                    end tell
-                end tell
-            end tell
-        end tell
-        delay 0.3
-        keystroke "v" using command down
-    end tell
-end tell`);
+  writeFileSync(rtfPath, rtf);
+  return { tmpPath: rtfPath, snippet: `set content of ${msgVar} to (read POSIX file "${rtfPath}" as «class RTF »)` };
 }
 
 function handleCompose(args) {
@@ -1310,20 +1225,23 @@ function handleCompose(args) {
     const to = args?.to || "";
     const cc = args?.cc || "";
 
-    let script = `tell application "Mail"
-    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", content:"", visible:true}`;
-
-    if (to) {
-      script += `\n    tell newMsg\n        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}\n    end tell`;
-    }
-    if (cc) {
-      script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:"${escapeForAppleScript(cc)}"}\n    end tell`;
-    }
-    script += `\n    activate\nend tell`;
-    runAppleScript(script);
-
-    if (body.trim()) {
-      try { pasteHtmlBody(htmlBody); } catch (e) { /* window open, paste failed — still usable */ }
+    let tmpPath = null;
+    try {
+      let bodySnippet = "";
+      if (body.trim()) {
+        const rtf = setRtfBody(htmlBody, "newMsg");
+        tmpPath = rtf.tmpPath;
+        bodySnippet = `\n    ${rtf.snippet}`;
+      }
+      let script = `tell application "Mail"
+    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:true}`;
+      if (to) script += `\n    tell newMsg\n        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}\n    end tell`;
+      if (cc) script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:"${escapeForAppleScript(cc)}"}\n    end tell`;
+      script += bodySnippet;
+      script += `\n    activate\nend tell`;
+      runAppleScript(script);
+    } finally {
+      if (tmpPath) try { unlinkSync(tmpPath); } catch {}
     }
     return ok(`Draft created: ${subject}`);
   }
@@ -1343,21 +1261,27 @@ function handleCompose(args) {
           : "reply msg with opening window"
         : "forward msg with opening window";
 
-    const script = `tell application "Mail"
+    let tmpPath = null;
+    try {
+      let bodySnippet = "";
+      if (body.trim()) {
+        const rtf = setRtfBody(htmlBody, "replyMsg");
+        tmpPath = rtf.tmpPath;
+        bodySnippet = `\n    ${rtf.snippet}`;
+      }
+      const script = `tell application "Mail"
     set targetBox to mailbox "${escapeForAppleScript(loc.mailbox)}" of account "${escapeForAppleScript(loc.account)}"
     set msgs to (every message of targetBox whose id is ${Number(emailId)})
     if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
     set msg to item 1 of msgs
-    ${action}
+    set replyMsg to (${action})${bodySnippet}
     activate
     return "ok"
 end tell`;
-
-    const result = runAppleScript(script);
-    if (result.startsWith("Error:")) return err(result.slice(7));
-
-    if (body.trim()) {
-      try { pasteHtmlBody(htmlBody); } catch (e) { /* window open, paste failed — still usable */ }
+      const result = runAppleScript(script);
+      if (result.startsWith("Error:")) return err(result.slice(7));
+    } finally {
+      if (tmpPath) try { unlinkSync(tmpPath); } catch {}
     }
     return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
   }
@@ -1398,6 +1322,72 @@ end tell`;
   return ok(result);
 }
 
+// --- send_email ---
+
+function handleSendEmail(args) {
+  const config = loadSendConfig();
+  if (!config) return err("send_email is not available on this machine.");
+
+  const to = (args?.to || "").toLowerCase().trim();
+  const subject = args?.subject || "";
+  const body = args?.body || "";
+
+  if (!to) return err("Recipient (to) is required.");
+  if (!subject) return err("Subject is required.");
+  if (!body) return err("Body is required.");
+
+  // Allowlist check
+  if (!config.allowed_recipients.includes(to)) {
+    return err("Recipient not in allowlist.");
+  }
+
+  // Rate limit check
+  try {
+    if (existsSync(SEND_TIMESTAMP_PATH)) {
+      const stat = statSync(SEND_TIMESTAMP_PATH);
+      const elapsed = (Date.now() - stat.mtimeMs) / 1000;
+      if (elapsed < config.min_interval_seconds) {
+        const wait = Math.ceil(config.min_interval_seconds - elapsed);
+        return err(`Rate limited. Next send available in ${wait}s.`);
+      }
+    }
+  } catch {}
+
+  const dryRun = args?.dry_run === true;
+  const htmlBody = markdownToHtml(body);
+
+  let tmpPath = null;
+  try {
+    const rtf = setRtfBody(htmlBody, "newMsg");
+    tmpPath = rtf.tmpPath;
+
+    const script = `tell application "Mail"
+    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:${dryRun}}
+    tell newMsg
+        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}
+        set sender to "${escapeForAppleScript(config.from_email)}"
+        ${rtf.snippet}
+    end tell
+    ${dryRun ? 'activate\n    return "draft"' : 'send newMsg\n    return "sent"'}
+end tell`;
+
+    const result = runAppleScript(script, { timeout: 30000 });
+    if (dryRun) return ok(`Dry run: draft opened for "${subject}"`);
+    if (!result.includes("sent")) return err("Send failed: " + result);
+  } catch (e) {
+    return err(`${dryRun ? "Dry run" : "Send"} failed: ` + e.message);
+  } finally {
+    if (tmpPath) try { unlinkSync(tmpPath); } catch {}
+  }
+
+  // Update rate limit timestamp (skipped for dry run)
+  try {
+    writeFileSync(SEND_TIMESTAMP_PATH, new Date().toISOString(), "utf-8");
+  } catch {}
+
+  return ok(`Email sent to ${to}: "${subject}"`);
+}
+
 // --- archive_emails ---
 
 function handleArchiveEmails(args) {
@@ -1422,23 +1412,19 @@ function handleArchiveEmails(args) {
   const errors = [];
 
   for (const { account, mailbox, ids } of Object.values(byMailbox)) {
-    // Build AppleScript ID list
-    const idList = ids.join(", ");
-    const script = `tell application "Mail"
-    set theBox to mailbox "${escapeForAppleScript(mailbox)}" of account "${escapeForAppleScript(account)}"
-    set archived to 0
-    repeat with msgId in {${idList}}
-        set msgs to (every message of theBox whose id is msgId)
-        if (count of msgs) > 0 then
-            delete item 1 of msgs
-            set archived to archived + 1
-        end if
-    end repeat
-    return archived
-end tell`;
+    const script = `
+      var mail = Application("Mail");
+      var acct = mail.accounts.whose({name: ${JSON.stringify(account)}})[0];
+      var box = acct.mailboxes.whose({name: ${JSON.stringify(mailbox)}})[0];
+      var count = 0;
+      ${JSON.stringify(ids)}.forEach(function(id) {
+        try { mail.delete(box.messages.byId(id)); count++; } catch(e) {}
+      });
+      count;
+    `;
 
     try {
-      const count = parseInt(runAppleScript(script, { timeout: 120000 }), 10) || 0;
+      const count = parseInt(runJxa(script, { timeout: 120000 }), 10) || 0;
       archived += count;
     } catch (e) {
       errors.push(`${account}/${mailbox}: ${e.message}`);
@@ -1467,6 +1453,10 @@ export {
   accountUuidFromUrl,
   mailboxFromUrl,
   mboxPathFromUrl,
+  loadSendConfig,
+  SEND_MIN_INTERVAL_FLOOR,
+  SEND_CONFIG_PATH,
+  SEND_TIMESTAMP_PATH,
 };
 
 // --- Start server ---
