@@ -6,8 +6,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { execSync, exec } from "child_process";
 import { marked } from "marked";
-import { readFileSync, writeFileSync, unlinkSync, accessSync, readdirSync, existsSync, mkdirSync, statSync, constants as fsConst } from "fs";
-import { join } from "path";
+import { readFileSync, writeFileSync, unlinkSync, accessSync, readdirSync, existsSync, mkdirSync, statSync, copyFileSync, constants as fsConst } from "fs";
+import { join, basename, extname } from "path";
+import { tmpdir } from "os";
 
 const SEND_CONFIG_PATH = join(process.env.HOME || "", ".mcp-apple-mail", "send-config.json");
 const SEND_TIMESTAMP_PATH = join(process.env.HOME || "", ".mcp-apple-mail", "last-send-ts");
@@ -380,6 +381,19 @@ const TOOLS = [
       required: ["query"],
     },
   },
+  {
+    name: "download_attachment",
+    description: "Download attachment(s) from an email. Use get_email to see filenames.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email_id: { type: "number", description: "Email ID." },
+        attachment_name: { type: "string", description: "Filename (omit for all)." },
+        destination: { type: "string", description: "Save directory (default: /tmp/mail-attachments/)." },
+      },
+      required: ["email_id"],
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -429,6 +443,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = handleSearchBody(args); break;
       case "send_email":
         result = handleSendEmail(args); break;
+      case "download_attachment":
+        result = handleDownloadAttachment(args); break;
       default:
         return err(`Unknown tool: ${name}`);
     }
@@ -1037,6 +1053,16 @@ function handleSearchEmails(args) {
     return ok(query ? `No emails matching "${query}".` : "No emails found.");
   }
 
+  // Batch check which messages have attachments
+  const ids = data.map(e => e.id);
+  const attSet = new Set();
+  if (ids.length) {
+    try {
+      const attRows = parseSqlite(`SELECT DISTINCT message FROM attachments WHERE message IN (${ids.join(",")})`);
+      for (const r of attRows) attSet.add(r.message);
+    } catch {}
+  }
+
   const lines = data.map((e) => {
     const date = e.date_received
       ? new Date(e.date_received * 1000).toISOString().slice(0, 10)
@@ -1046,7 +1072,8 @@ function handleSearchEmails(args) {
       : e.sender_name || e.sender_addr || "";
     const account = accountFromUrl(e.mailbox_url || "");
     const mailbox = mailboxFromUrl(e.mailbox_url || "");
-    return `ID:${e.id} | ${e.read ? " " : "●"} ${e.flagged ? "⚑ " : ""}${date} | ${from} | ${e.subject || "(no subject)"} [${account}/${mailbox}]`;
+    const att = attSet.has(e.id) ? "📎 " : "";
+    return `ID:${e.id} | ${e.read ? " " : "●"} ${e.flagged ? "⚑ " : ""}${att}${date} | ${from} | ${e.subject || "(no subject)"} [${account}/${mailbox}]`;
   });
   return ok(lines.join("\n"));
 }
@@ -1080,6 +1107,8 @@ function handleGetEmail(args) {
       if (data.cc) parts.push(`CC: ${data.cc}`);
       parts.push(`Date: ${data.date}`);
       parts.push(`Read: ${isRead} | Flagged: ${isFlagged}`);
+      const attInfo = getAttachmentInfo(emailId);
+      if (attInfo.length) parts.push(formatAttachmentList(attInfo));
       parts.push("");
       parts.push(body);
       return ok(parts.join("\n"));
@@ -1134,6 +1163,8 @@ function handleGetEmail(args) {
   if (data.cc) parts.push(`CC: ${data.cc}`);
   parts.push(`Date: ${data.date}`);
   parts.push(`Read: ${data.read} | Flagged: ${data.flagged}`);
+  const attInfo = getAttachmentInfo(emailId);
+  if (attInfo.length) parts.push(formatAttachmentList(attInfo));
   parts.push("");
   parts.push(body);
 
@@ -1435,6 +1466,108 @@ function handleArchiveEmails(args) {
   if (notFound.length > 0) parts.push(`Not found: ${notFound.join(", ")}`);
   if (errors.length > 0) parts.push(`Errors: ${errors.join("; ")}`);
   return ok(parts.join("\n"));
+}
+
+// --- attachments ---
+
+function getAttachmentInfo(emailId) {
+  const id = Number(emailId);
+  return parseSqlite(`SELECT attachment_id, name FROM attachments WHERE message = ${id}`);
+}
+
+function findAttachmentDir(emailId) {
+  if (!internalUuid) return null;
+  const id = Number(emailId);
+  const rows = parseSqlite(`SELECT mb.url FROM messages m JOIN mailboxes mb ON mb.ROWID = m.mailbox WHERE m.ROWID = ${id}`);
+  if (!rows.length) return null;
+
+  const url = rows[0].url;
+  const acctUuid = accountUuidFromUrl(url);
+  const mboxSegs = mboxPathFromUrl(url);
+  if (!acctUuid || !mboxSegs) return null;
+
+  const mboxDir = `${MAIL_V10_DIR}/${acctUuid}/${mboxSegs.join("/")}/${internalUuid}/Data`;
+
+  // Check sharded dirs then flat
+  for (const shard of SHARD_PAIRS) {
+    const dir = `${mboxDir}/${shard}/Attachments/${id}`;
+    if (existsSync(dir)) return dir;
+  }
+  const flatDir = `${mboxDir}/Attachments/${id}`;
+  if (existsSync(flatDir)) return flatDir;
+  return null;
+}
+
+function formatAttachmentList(attachments) {
+  if (!attachments.length) return "";
+  const lines = [`Attachments (${attachments.length}):`];
+  for (const att of attachments) {
+    lines.push(`  - ${att.name}`);
+  }
+  return "\n" + lines.join("\n");
+}
+
+function uniquePath(dir, emailId, filename) {
+  const ext = extname(filename);
+  const base = basename(filename, ext);
+  const prefix = `${emailId}_${base}`;
+  let candidate = join(dir, `${prefix}${ext}`);
+  if (!existsSync(candidate)) return candidate;
+  let n = 1;
+  while (true) {
+    candidate = join(dir, `${prefix}_${n}${ext}`);
+    if (!existsSync(candidate)) return candidate;
+    n++;
+  }
+}
+
+function handleDownloadAttachment(args) {
+  const emailId = args?.email_id;
+  if (!emailId) return err("email_id is required.");
+
+  const attachmentName = args?.attachment_name || null;
+  const saveDir = args?.destination || "/tmp/mail-attachments";
+
+  const attachments = getAttachmentInfo(emailId);
+  if (!attachments.length) return err(`Email ${emailId} has no attachments.`);
+
+  const attDir = findAttachmentDir(emailId);
+  if (!attDir) return err(`Attachment files not found on disk for email ${emailId}. The email may not be fully downloaded.`);
+
+  // Filter to requested attachment if specified
+  const toDownload = attachmentName
+    ? attachments.filter(a => a.name === attachmentName)
+    : attachments;
+
+  if (!toDownload.length) {
+    const available = attachments.map(a => a.name).join(", ");
+    return err(`Attachment "${attachmentName}" not found. Available: ${available}`);
+  }
+
+  mkdirSync(saveDir, { recursive: true });
+
+  const output = [];
+  for (const att of toDownload) {
+    // Attachment files live at {attDir}/{attachment_id}/{filename}
+    const srcDir = join(attDir, att.attachment_id);
+    if (!existsSync(srcDir)) {
+      output.push(`Skipped: ${att.name} (not on disk)`);
+      continue;
+    }
+    // Find the actual file in the attachment_id subdirectory
+    const files = readdirSync(srcDir).filter(f => !f.startsWith("."));
+    if (!files.length) {
+      output.push(`Skipped: ${att.name} (empty directory)`);
+      continue;
+    }
+    const srcFile = join(srcDir, files[0]);
+    const destFile = uniquePath(saveDir, emailId, att.name);
+    copyFileSync(srcFile, destFile);
+    const size = statSync(destFile).size;
+    output.push(`Saved: ${destFile} (${size} bytes)`);
+  }
+
+  return ok(output.join("\n"));
 }
 
 // --- Exports for testing ---
