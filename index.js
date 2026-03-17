@@ -269,6 +269,7 @@ function loadSendConfig() {
       from_email: config.from_email.toLowerCase().trim(),
       allowed_recipients: config.allowed_recipients.map(r => r.toLowerCase().trim()),
       min_interval_seconds: Math.max(SEND_MIN_INTERVAL_FLOOR, Number(config.min_interval_seconds) || SEND_MIN_INTERVAL_FLOOR),
+      signature_name: config.signature_name || null,
     };
     return _sendConfigCache;
   } catch {
@@ -331,6 +332,7 @@ const TOOLS = [
         cc: { type: "string" },
         email_id: { type: "number", description: "Email ID (reply/forward)." },
         reply_all: { type: "boolean", description: "Reply all." },
+        from: { type: "string", description: "Sender email (new). Sets From address and signature from send config." },
       },
       required: ["mode", "body"],
     },
@@ -1255,6 +1257,16 @@ function handleCompose(args) {
     const subject = args?.subject || "";
     const to = args?.to || "";
     const cc = args?.cc || "";
+    const from = args?.from || "";
+
+    // Resolve signature from send config if from matches
+    let signatureName = null;
+    if (from) {
+      const config = loadSendConfig();
+      if (config && config.from_email === from.toLowerCase().trim() && config.signature_name) {
+        signatureName = config.signature_name;
+      }
+    }
 
     let tmpPath = null;
     try {
@@ -1268,7 +1280,9 @@ function handleCompose(args) {
     set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:true}`;
       if (to) script += `\n    tell newMsg\n        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}\n    end tell`;
       if (cc) script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:"${escapeForAppleScript(cc)}"}\n    end tell`;
+      if (from) script += `\n    tell newMsg\n        set sender to "${escapeForAppleScript(from)}"\n    end tell`;
       script += bodySnippet;
+      if (signatureName) script += `\n    set message signature of newMsg to signature "${escapeForAppleScript(signatureName)}"`;
       script += `\n    activate\nend tell`;
       runAppleScript(script);
     } finally {
@@ -1392,13 +1406,16 @@ function handleSendEmail(args) {
     const rtf = setRtfBody(htmlBody, "newMsg");
     tmpPath = rtf.tmpPath;
 
+    const sigLine = config.signature_name
+      ? `\n        set message signature of newMsg to signature "${escapeForAppleScript(config.signature_name)}"`
+      : "";
     const script = `tell application "Mail"
     set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:${dryRun}}
     tell newMsg
         make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}
         set sender to "${escapeForAppleScript(config.from_email)}"
-        ${rtf.snippet}
     end tell
+    ${rtf.snippet}${sigLine}
     ${dryRun ? 'activate\n    return "draft"' : 'send newMsg\n    return "sent"'}
 end tell`;
 
