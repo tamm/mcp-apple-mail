@@ -321,7 +321,7 @@ const TOOLS = [
   },
   {
     name: "compose",
-    description: "Draft new email, reply, or forward. Body is markdown.",
+    description: "Open a draft in Mail.app for new emails, replies, or forwards. Safe to use freely — cannot send, no restrictions, no allowlist. The user reviews and sends manually. Body is markdown.",
     inputSchema: {
       type: "object",
       properties: {
@@ -405,14 +405,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (loadSendConfig()) {
     tools.push({
       name: "send_email",
-      description: "Send an email (restricted: allowlisted recipients only, rate limited). Only available when send config is active.",
+      description: "Send an email immediately (no draft, no user review). Restricted: allowlisted recipients only, rate limited. Requires send config. To create a draft instead, use compose.",
       inputSchema: {
         type: "object",
         properties: {
           to: { type: "string", description: "Recipient email (must be in allowlist)." },
           subject: { type: "string", description: "Email subject." },
           body: { type: "string", description: "Email body (markdown, converted to HTML)." },
-          dry_run: { type: "boolean", description: "If true, opens a draft instead of sending. For testing." },
         },
         required: ["to", "subject", "body"],
       },
@@ -1398,7 +1397,6 @@ function handleSendEmail(args) {
     }
   } catch {}
 
-  const dryRun = args?.dry_run === true;
   const htmlBody = markdownToHtml(body);
 
   let tmpPath = null;
@@ -1410,25 +1408,25 @@ function handleSendEmail(args) {
       ? `\n        set message signature of newMsg to signature "${escapeForAppleScript(config.signature_name)}"`
       : "";
     const script = `tell application "Mail"
-    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:${dryRun}}
+    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:false}
     tell newMsg
         make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}
         set sender to "${escapeForAppleScript(config.from_email)}"
     end tell
     ${rtf.snippet}${sigLine}
-    ${dryRun ? 'activate\n    return "draft"' : 'send newMsg\n    return "sent"'}
+    send newMsg
+    return "sent"
 end tell`;
 
     const result = runAppleScript(script, { timeout: 30000 });
-    if (dryRun) return ok(`Dry run: draft opened for "${subject}"`);
     if (!result.includes("sent")) return err("Send failed: " + result);
   } catch (e) {
-    return err(`${dryRun ? "Dry run" : "Send"} failed: ` + e.message);
+    return err("Send failed: " + e.message);
   } finally {
     if (tmpPath) try { unlinkSync(tmpPath); } catch {}
   }
 
-  // Update rate limit timestamp (skipped for dry run)
+  // Update rate limit timestamp
   try {
     writeFileSync(SEND_TIMESTAMP_PATH, new Date().toISOString(), "utf-8");
   } catch {}
