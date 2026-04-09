@@ -182,7 +182,8 @@ function findMessageLocation(emailId) {
     for (const url of allUrls) {
       const mbox = mailboxFromUrl(url);
       const account = accountFromUrl(url);
-      const loc = { account, mailbox: mbox };
+      const mboxPath = mailboxPathFromUrl(url) || [mbox];
+      const loc = { account, mailbox: mbox, mailboxPath: mboxPath };
       if (!VIRTUAL_MAILBOXES.has(mbox)) {
         best = loc;
         break;
@@ -198,31 +199,44 @@ function findMessageLocation(emailId) {
     const msgId = ${Number(emailId)};
     const virtual = new Set(${JSON.stringify([...VIRTUAL_MAILBOXES])});
 
+    function searchBoxes(boxes, path) {
+      for (const box of boxes) {
+        try {
+          const name = box.name();
+          const curPath = path.concat([name]);
+          const msgs = box.messages.whose({id: msgId})();
+          if (msgs.length > 0) return {name, path: curPath};
+          // Search nested mailboxes (e.g. [Gmail]/All Mail)
+          const nested = box.mailboxes();
+          if (nested.length > 0) {
+            const found = searchBoxes(nested, curPath);
+            if (found) return found;
+          }
+        } catch(e) {}
+      }
+      return null;
+    }
+
     function find() {
       let fallback = null;
       const accounts = mail.accounts();
+      // Check INBOX first (most common)
       for (const acct of accounts) {
         try {
           const inbox = acct.mailboxes.whose({name: "INBOX"})();
           if (inbox.length > 0) {
             const msgs = inbox[0].messages.whose({id: msgId})();
-            if (msgs.length > 0) return {account: acct.name(), mailbox: "INBOX"};
+            if (msgs.length > 0) return {account: acct.name(), mailbox: "INBOX", mailboxPath: ["INBOX"]};
           }
         } catch(e) {}
       }
+      // Search all mailboxes including nested
       for (const acct of accounts) {
-        const boxes = acct.mailboxes();
-        for (const box of boxes) {
-          try {
-            const name = box.name();
-            if (name === "INBOX") continue;
-            const msgs = box.messages.whose({id: msgId})();
-            if (msgs.length > 0) {
-              const loc = {account: acct.name(), mailbox: name};
-              if (!virtual.has(name)) return loc;
-              if (!fallback) fallback = loc;
-            }
-          } catch(e) {}
+        const found = searchBoxes(acct.mailboxes(), []);
+        if (found) {
+          const loc = {account: acct.name(), mailbox: found.name, mailboxPath: found.path};
+          if (!virtual.has(found.name)) return loc;
+          if (!fallback) fallback = loc;
         }
       }
       return fallback;
@@ -819,6 +833,34 @@ function mailboxFromUrl(url) {
   return decodeURIComponent(parts[parts.length - 1]);
 }
 
+// Return all mailbox path segments from a URL (e.g. ["[Gmail]", "All Mail"])
+// Needed because JXA/AppleScript require traversing nested mailboxes
+function mailboxPathFromUrl(url) {
+  const m = url.match(/^[a-z]+:\/\/[A-F0-9-]+\/(.+)$/i);
+  if (!m) return null;
+  return m[1].split("/").map(s => decodeURIComponent(s));
+}
+
+// Generate JXA expression to resolve a (possibly nested) mailbox from path segments
+// e.g. ["[Gmail]", "All Mail"] -> acct.mailboxes.whose({name:"[Gmail]"})[0].mailboxes.whose({name:"All Mail"})[0]
+function jxaMailboxExpr(acctVar, pathSegments) {
+  let expr = acctVar;
+  for (const seg of pathSegments) {
+    expr += `.mailboxes.whose({name:${JSON.stringify(seg)}})()[0]`;
+  }
+  return expr;
+}
+
+// Generate AppleScript expression to resolve a (possibly nested) mailbox
+// e.g. ["[Gmail]", "All Mail"] -> mailbox "All Mail" of mailbox "[Gmail]" of account "acctName"
+function asMailboxExpr(acctName, pathSegments) {
+  let expr = `account "${escapeForAppleScript(acctName)}"`;
+  for (const seg of pathSegments) {
+    expr = `mailbox "${escapeForAppleScript(seg)}" of ${expr}`;
+  }
+  return expr;
+}
+
 function runSqlite(query) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
@@ -1129,7 +1171,7 @@ function handleGetEmail(args) {
     let found = null;
     try {
       const acct = mail.accounts.whose({name: ${escapeForJxa(loc.account)}})()[0];
-      const box = acct.mailboxes.whose({name: ${escapeForJxa(loc.mailbox)}})()[0];
+      const box = ${jxaMailboxExpr("acct", loc.mailboxPath || [loc.mailbox])};
       const msgs = box.messages.whose({id: msgId})();
       if (msgs.length > 0) {
         const m = msgs[0];
@@ -1313,8 +1355,9 @@ function handleCompose(args) {
         tmpPath = rtf.tmpPath;
         bodySnippet = `\n    ${rtf.snippet}`;
       }
+      const sourceExpr = asMailboxExpr(loc.account, loc.mailboxPath || [loc.mailbox]);
       const script = `tell application "Mail"
-    set targetBox to mailbox "${escapeForAppleScript(loc.mailbox)}" of account "${escapeForAppleScript(loc.account)}"
+    set targetBox to ${sourceExpr}
     set msgs to (every message of targetBox whose id is ${Number(emailId)})
     if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
     set msg to item 1 of msgs
@@ -1347,14 +1390,19 @@ function handleMoveEmail(args) {
 
   const destAccount = accountName || loc.account;
 
+  // Parse destination as path segments (e.g. "[Gmail]/Trash" -> ["[Gmail]", "Trash"])
+  const destPath = destination.includes("/") ? destination.split("/") : [destination];
+  const sourceExpr = asMailboxExpr(loc.account, loc.mailboxPath || [loc.mailbox]);
+  const destExpr = asMailboxExpr(destAccount, destPath);
+
   const script = `tell application "Mail"
-    set targetBox to mailbox "${escapeForAppleScript(loc.mailbox)}" of account "${escapeForAppleScript(loc.account)}"
+    set targetBox to ${sourceExpr}
     set msgs to (every message of targetBox whose id is ${Number(emailId)})
     if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
     set targetMsg to item 1 of msgs
     set destBox to missing value
     try
-        set destBox to mailbox "${escapeForAppleScript(destination)}" of account "${escapeForAppleScript(destAccount)}"
+        set destBox to ${destExpr}
     end try
     if destBox is missing value then return "Error: Mailbox '${escapeForAppleScript(destination)}' not found."
     move targetMsg to destBox
@@ -1450,21 +1498,49 @@ function handleArchiveEmails(args) {
       continue;
     }
     const key = `${loc.account}|||${loc.mailbox}`;
-    if (!byMailbox[key]) byMailbox[key] = { account: loc.account, mailbox: loc.mailbox, ids: [] };
+    if (!byMailbox[key]) byMailbox[key] = { account: loc.account, mailbox: loc.mailbox, mailboxPath: loc.mailboxPath || [loc.mailbox], ids: [] };
     byMailbox[key].ids.push(Number(id));
   }
 
   let archived = 0;
   const errors = [];
 
-  for (const { account, mailbox, ids } of Object.values(byMailbox)) {
+  for (const { account, mailbox, mailboxPath, ids } of Object.values(byMailbox)) {
+    // Build JXA to find the archive mailbox, searching both top-level and nested (Gmail [Gmail]/All Mail)
+    const archiveCandidates = [
+      ["All Mail"],           // top-level
+      ["[Gmail]", "All Mail"],// Gmail nested
+      ["Archive"],            // top-level
+      ["All Messages"],       // top-level
+      ["[Gmail]", "All Messages"], // Gmail nested variant
+    ];
+    // Generate JXA search code for each candidate
+    const candidateChecks = archiveCandidates.map(path => {
+      const expr = jxaMailboxExpr("acct", path);
+      // Call .name() to verify the mailbox is real — dead specifiers throw here
+      return `if (!archiveBox) { try { var c = ${expr}; c.name(); archiveBox = c; } catch(e) {} }`;
+    }).join("\n      ");
+
+    const sourceBoxExpr = jxaMailboxExpr("acct", mailboxPath);
+
     const script = `
       var mail = Application("Mail");
-      var acct = mail.accounts.whose({name: ${JSON.stringify(account)}})[0];
-      var box = acct.mailboxes.whose({name: ${JSON.stringify(mailbox)}})[0];
+      var acct = mail.accounts.whose({name: ${JSON.stringify(account)}})()[0];
+      var box = ${sourceBoxExpr};
+
+      // Find the archive mailbox (search nested mailboxes for Gmail)
+      var archiveBox = null;
+      ${candidateChecks}
+
+      if (!archiveBox) { throw new Error("No archive mailbox found for account " + ${JSON.stringify(account)}); }
+
       var count = 0;
       ${JSON.stringify(ids)}.forEach(function(id) {
-        try { mail.delete(box.messages.byId(id)); count++; } catch(e) {}
+        try {
+          var msg = box.messages.byId(id);
+          mail.move(msg, {to: archiveBox});
+          count++;
+        } catch(e) {}
       });
       count;
     `;
