@@ -180,6 +180,87 @@ describe("validateAttachments", () => {
     assert.ok(Array.isArray(result));
     assert.deepEqual(result, [specialPath]);
   });
+
+  it("rejects path with trailing slash (not canonical)", () => {
+    const filePath = createTestFile("file-with-slash.txt", 512);
+    // Append slash to make it non-canonical
+    const nonCanonicalPath = filePath + "/";
+    const result = validateAttachments([nonCanonicalPath]);
+    assert.equal(typeof result, "string");
+    assert.ok(result.includes("not canonical"));
+  });
+
+  it("rejects path with single .. (traversal attempt)", () => {
+    const result = validateAttachments(["/tmp/foo/../bar/file.txt"]);
+    assert.equal(typeof result, "string");
+    assert.ok(result.includes("not canonical"));
+  });
+
+  it("rejects path with ... (three dots) if it normalizes differently", () => {
+    // Three dots is not special in path resolution, but test the edge case
+    // A path like /tmp/.../file should only fail if the directory doesn't exist
+    const result = validateAttachments(["/tmp/.../nonexistent-file.txt"]);
+    assert.equal(typeof result, "string");
+    // Could be "not found" or "not canonical" depending on normalization
+    assert.ok(result.includes("not found") || result.includes("not canonical"));
+  });
+
+  it("returns canonical paths in the result array", () => {
+    const filePath = createTestFile("canonical-test.txt", 512);
+    const result = validateAttachments([filePath]);
+    assert.ok(Array.isArray(result));
+    // The result should contain the canonical path
+    assert.equal(result[0], filePath);
+  });
+
+  it("rejects path in /etc when allowlist is set via env", function(t) {
+    // Save and clear env
+    const savedEnv = process.env.APPLE_MAIL_ATTACHMENT_DIRS;
+    try {
+      process.env.APPLE_MAIL_ATTACHMENT_DIRS = "/tmp:/var/folders";
+      const result = validateAttachments(["/etc/passwd"]);
+      assert.equal(typeof result, "string");
+      assert.ok(result.includes("not in allowed directories"));
+    } finally {
+      if (savedEnv === undefined) {
+        delete process.env.APPLE_MAIL_ATTACHMENT_DIRS;
+      } else {
+        process.env.APPLE_MAIL_ATTACHMENT_DIRS = savedEnv;
+      }
+    }
+  });
+
+  it("accepts path in /tmp when allowlist includes it", function(t) {
+    const filePath = createTestFile("allowlist-test.txt", 512);
+    const savedEnv = process.env.APPLE_MAIL_ATTACHMENT_DIRS;
+    try {
+      process.env.APPLE_MAIL_ATTACHMENT_DIRS = "/tmp:/var/folders";
+      const result = validateAttachments([filePath]);
+      assert.ok(Array.isArray(result));
+      assert.equal(result.length, 1);
+    } finally {
+      if (savedEnv === undefined) {
+        delete process.env.APPLE_MAIL_ATTACHMENT_DIRS;
+      } else {
+        process.env.APPLE_MAIL_ATTACHMENT_DIRS = savedEnv;
+      }
+    }
+  });
+
+  it("allows any path when allowlist env is not set", () => {
+    const savedEnv = process.env.APPLE_MAIL_ATTACHMENT_DIRS;
+    try {
+      delete process.env.APPLE_MAIL_ATTACHMENT_DIRS;
+      // Create a file in /tmp (the default secure location)
+      const filePath = createTestFile("permissive-test.txt", 512);
+      const result = validateAttachments([filePath]);
+      assert.ok(Array.isArray(result));
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.APPLE_MAIL_ATTACHMENT_DIRS = savedEnv;
+      }
+    }
+  });
 });
 
 // --- Constants validation ---

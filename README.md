@@ -63,6 +63,18 @@ const result = await send_email({
 - Maximum 25 MB per file
 - Must be absolute paths (e.g., `/tmp/...`, not `./relative/path`)
 - Must be regular files (not directories or symlinks)
+- Must be in canonical form (no `..` or redundant separators)
+
+**Security — Optional allowlist:**
+
+By default, any absolute file path is accepted. To restrict attachments to specific directories (recommended for security-sensitive setups), set the `APPLE_MAIL_ATTACHMENT_DIRS` environment variable (colon-separated list of allowed directories):
+
+```bash
+export APPLE_MAIL_ATTACHMENT_DIRS="/tmp:/Users/me/Downloads"
+node index.js
+```
+
+When set, only files within these directories (or their subdirectories) are allowed. Without this setting, the server permits attachments from anywhere on the filesystem — the normal behavior for local MCP use.
 
 ## Install
 
