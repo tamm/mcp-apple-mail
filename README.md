@@ -29,10 +29,52 @@ This server reads Mail.app's SQLite database (`Envelope Index`) directly for sea
 | `search_emails` | `query?`, `mailbox?` (default INBOX), `account?`, `limit?` (default 10, max 50) | One-line summaries: ID, date, sender, subject, read/flagged status |
 | `get_email` | `email_id` | Headers + cleaned body (signatures and quoted replies stripped) + attachment list |
 | `search_body` | `query`, `limit?` (default 20) | Relevance-ranked full-text results with body snippets; includes index coverage status |
-| `compose` | `mode` (new/reply/forward), `body` (markdown), `to?`, `subject?`, `cc?`, `email_id?`, `reply_all?` | Opens compose window in Mail.app with draft |
+| `compose` | `mode` (new/reply/forward), `body` (markdown), `to?`, `subject?`, `cc?`, `email_id?`, `reply_all?`, `attachments?` (array of absolute paths) | Opens compose window in Mail.app with draft |
 | `move_email` | `email_id`, `destination`, `account?` | Confirmation message |
 | `archive_emails` | `email_ids` (array), `account?` | Archive summary (Gmail: removes INBOX label) |
 | `download_attachment` | `email_id`, `attachment_name?`, `destination?` | Saves attachment(s) to disk (default `/tmp/mail-attachments/`) |
+| `send_email` | `to`, `subject`, `body` (markdown), `attachments?` (array of absolute paths) | Sends email directly (requires send config) |
+
+## Attachments
+
+Both `compose` and `send_email` support optional attachments. Pass an array of absolute file paths:
+
+```javascript
+// compose with attachment
+const result = await compose({
+  mode: "new",
+  to: "user@example.com",
+  subject: "Meeting notes",
+  body: "Here are the notes from today's meeting.",
+  attachments: ["/tmp/meeting-notes.pdf"]
+});
+
+// send_email with attachment
+const result = await send_email({
+  to: "user@example.com",
+  subject: "Invoice",
+  body: "Please see the attached invoice.",
+  attachments: ["/tmp/invoice.pdf", "/tmp/receipt.pdf"]
+});
+```
+
+**Limits:**
+- Maximum 10 files per email
+- Maximum 25 MB per file
+- Must be absolute paths (e.g., `/tmp/...`, not `./relative/path`)
+- Must be regular files (not directories or symlinks)
+- Must be in canonical form (no `..` or redundant separators)
+
+**Security — Optional allowlist:**
+
+By default, any absolute file path is accepted. To restrict attachments to specific directories (recommended for security-sensitive setups), set the `APPLE_MAIL_ATTACHMENT_DIRS` environment variable (colon-separated list of allowed directories):
+
+```bash
+export APPLE_MAIL_ATTACHMENT_DIRS="/tmp:/Users/me/Downloads"
+node index.js
+```
+
+When set, only files within these directories (or their subdirectories) are allowed. Without this setting, the server permits attachments from anywhere on the filesystem — the normal behavior for local MCP use.
 
 ## Install
 
