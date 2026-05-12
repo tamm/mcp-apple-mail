@@ -8,6 +8,8 @@ Lean MCP server for Apple Mail on macOS. Read, search, compose, and organise ema
 
 Works with Gmail, iCloud, and standard IMAP accounts -- any account configured in Mail.app.
 
+**Draft-only by design.** This server cannot send email. `compose` opens a draft in Mail.app for human review and manual sending. Tamm decided 2026-05-12 that automated email sending is unwanted regardless of recipient — the send capability was physically removed, not just disabled, so it cannot be re-enabled via config or flag.
+
 ## Why This One?
 
 Most Mail.app MCP servers shell out to AppleScript for everything. That's slow -- a simple INBOX search takes ~4 seconds via JXA.

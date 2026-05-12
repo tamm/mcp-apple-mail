@@ -10,13 +10,8 @@ import { readFileSync, writeFileSync, unlinkSync, accessSync, readdirSync, exist
 import { join, basename, extname } from "path";
 import { tmpdir } from "os";
 
-const SEND_CONFIG_PATH = join(process.env.HOME || "", ".mcp-apple-mail", "send-config.json");
-const SEND_TIMESTAMP_PATH = join(process.env.HOME || "", ".mcp-apple-mail", "last-send-ts");
-const SEND_MIN_INTERVAL_FLOOR = 120; // seconds — hardcoded, config can only increase
-const SEND_MAX_RECIPIENTS = 1;
-
 const server = new Server(
-  { name: "mcp-apple-mail", version: "1.0.0" },
+  { name: "mcp-apple-mail", version: "2.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -261,37 +256,6 @@ function escapeForJxa(str) {
   return JSON.stringify(str);
 }
 
-// --- Send config loader (cached, stat-invalidated) ---
-
-let _sendConfigCache = null;
-let _sendConfigMtime = 0;
-
-function loadSendConfig() {
-  try {
-    if (!existsSync(SEND_CONFIG_PATH)) { _sendConfigCache = null; return null; }
-    const mt = statSync(SEND_CONFIG_PATH).mtimeMs;
-    if (_sendConfigCache && mt === _sendConfigMtime) return _sendConfigCache;
-    const raw = readFileSync(SEND_CONFIG_PATH, "utf-8");
-    const config = JSON.parse(raw);
-    if (config.enabled !== true) { _sendConfigCache = null; return null; }
-    if (!config.from_account || typeof config.from_account !== "string") { _sendConfigCache = null; return null; }
-    if (!config.from_email || typeof config.from_email !== "string") { _sendConfigCache = null; return null; }
-    if (!Array.isArray(config.allowed_recipients) || config.allowed_recipients.length === 0) { _sendConfigCache = null; return null; }
-    _sendConfigMtime = mt;
-    _sendConfigCache = {
-      from_account: config.from_account,
-      from_email: config.from_email.toLowerCase().trim(),
-      allowed_recipients: config.allowed_recipients.map(r => r.toLowerCase().trim()),
-      min_interval_seconds: Math.max(SEND_MIN_INTERVAL_FLOOR, Number(config.min_interval_seconds) || SEND_MIN_INTERVAL_FLOOR),
-      signature_name: config.signature_name || null,
-    };
-    return _sendConfigCache;
-  } catch {
-    _sendConfigCache = null;
-    return null;
-  }
-}
-
 // --- Tool definitions ---
 
 const TOOLS = [
@@ -335,7 +299,7 @@ const TOOLS = [
   },
   {
     name: "compose",
-    description: "Open a draft in Mail.app for new emails, replies, or forwards. Safe to use freely — cannot send, no restrictions, no allowlist. The user reviews and sends manually. Body is markdown.",
+    description: "Open a draft in Mail.app for new emails, replies, or forwards. This server is draft-only — it cannot send. The user reviews and sends manually. Body is markdown.",
     inputSchema: {
       type: "object",
       properties: {
@@ -346,7 +310,7 @@ const TOOLS = [
         cc: { type: "string" },
         email_id: { type: "number", description: "Email ID (reply/forward)." },
         reply_all: { type: "boolean", description: "Reply all." },
-        from: { type: "string", description: "Sender email (new). Sets From address and signature from send config." },
+        from: { type: "string", description: "Sender email (new). Sets the From address; Mail.app applies that account's default signature." },
       },
       required: ["mode", "body"],
     },
@@ -415,23 +379,7 @@ const TOOLS = [
 // --- Tool handlers ---
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const tools = [...TOOLS];
-  if (loadSendConfig()) {
-    tools.push({
-      name: "send_email",
-      description: "Send an email immediately (no draft, no user review). Restricted: allowlisted recipients only, rate limited. Requires send config. To create a draft instead, use compose.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          to: { type: "string", description: "Recipient email (must be in allowlist)." },
-          subject: { type: "string", description: "Email subject." },
-          body: { type: "string", description: "Email body (markdown, converted to HTML)." },
-        },
-        required: ["to", "subject", "body"],
-      },
-    });
-  }
-  return { tools };
+  return { tools: TOOLS };
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -456,8 +404,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = handleIndexNow(args); break;
       case "search_body":
         result = handleSearchBody(args); break;
-      case "send_email":
-        result = handleSendEmail(args); break;
       case "download_attachment":
         result = handleDownloadAttachment(args); break;
       default:
@@ -1300,15 +1246,6 @@ function handleCompose(args) {
     const cc = args?.cc || "";
     const from = args?.from || "";
 
-    // Resolve signature from send config if from matches
-    let signatureName = null;
-    if (from) {
-      const config = loadSendConfig();
-      if (config && config.from_email === from.toLowerCase().trim() && config.signature_name) {
-        signatureName = config.signature_name;
-      }
-    }
-
     let tmpPath = null;
     try {
       let bodySnippet = "";
@@ -1323,7 +1260,6 @@ function handleCompose(args) {
       if (cc) script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:"${escapeForAppleScript(cc)}"}\n    end tell`;
       if (from) script += `\n    tell newMsg\n        set sender to "${escapeForAppleScript(from)}"\n    end tell`;
       script += bodySnippet;
-      if (signatureName) script += `\n    set message signature of newMsg to signature "${escapeForAppleScript(signatureName)}"`;
       script += `\n    activate\nend tell`;
       runAppleScript(script);
     } finally {
@@ -1412,74 +1348,6 @@ end tell`;
   const result = runAppleScript(script);
   if (result.startsWith("Error:")) return err(result.slice(7));
   return ok(result);
-}
-
-// --- send_email ---
-
-function handleSendEmail(args) {
-  const config = loadSendConfig();
-  if (!config) return err("send_email is not available on this machine.");
-
-  const to = (args?.to || "").toLowerCase().trim();
-  const subject = args?.subject || "";
-  const body = args?.body || "";
-
-  if (!to) return err("Recipient (to) is required.");
-  if (!subject) return err("Subject is required.");
-  if (!body) return err("Body is required.");
-
-  // Allowlist check
-  if (!config.allowed_recipients.includes(to)) {
-    return err("Recipient not in allowlist.");
-  }
-
-  // Rate limit check
-  try {
-    if (existsSync(SEND_TIMESTAMP_PATH)) {
-      const stat = statSync(SEND_TIMESTAMP_PATH);
-      const elapsed = (Date.now() - stat.mtimeMs) / 1000;
-      if (elapsed < config.min_interval_seconds) {
-        const wait = Math.ceil(config.min_interval_seconds - elapsed);
-        return err(`Rate limited. Next send available in ${wait}s.`);
-      }
-    }
-  } catch {}
-
-  const htmlBody = markdownToHtml(body);
-
-  let tmpPath = null;
-  try {
-    const rtf = setRtfBody(htmlBody, "newMsg");
-    tmpPath = rtf.tmpPath;
-
-    const sigLine = config.signature_name
-      ? `\n        set message signature of newMsg to signature "${escapeForAppleScript(config.signature_name)}"`
-      : "";
-    const script = `tell application "Mail"
-    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:false}
-    tell newMsg
-        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}
-        set sender to "${escapeForAppleScript(config.from_email)}"
-    end tell
-    ${rtf.snippet}${sigLine}
-    send newMsg
-    return "sent"
-end tell`;
-
-    const result = runAppleScript(script, { timeout: 30000 });
-    if (!result.includes("sent")) return err("Send failed: " + result);
-  } catch (e) {
-    return err("Send failed: " + e.message);
-  } finally {
-    if (tmpPath) try { unlinkSync(tmpPath); } catch {}
-  }
-
-  // Update rate limit timestamp
-  try {
-    writeFileSync(SEND_TIMESTAMP_PATH, new Date().toISOString(), "utf-8");
-  } catch {}
-
-  return ok(`Email sent to ${to}: "${subject}"`);
 }
 
 // --- archive_emails ---
@@ -1677,10 +1545,6 @@ export {
   accountUuidFromUrl,
   mailboxFromUrl,
   mboxPathFromUrl,
-  loadSendConfig,
-  SEND_MIN_INTERVAL_FLOOR,
-  SEND_CONFIG_PATH,
-  SEND_TIMESTAMP_PATH,
 };
 
 // --- Start server ---
