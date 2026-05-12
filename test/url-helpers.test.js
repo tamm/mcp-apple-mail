@@ -108,7 +108,7 @@ describe("markdownToHtml (extended)", () => {
     assert.ok(r.includes("<li>first</li>"));
     assert.ok(r.includes("<li>second</li>"));
     assert.ok(r.includes("<li>third</li>"));
-    assert.ok(r.includes("<ul>"));
+    assert.ok(r.includes("<ol>"));
   });
 
   it("combines bold and italic", () => {
