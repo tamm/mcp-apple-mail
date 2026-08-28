@@ -73,7 +73,8 @@ Or add to `.mcp.json` in your project:
 - macOS with Mail.app configured (at least one account)
 - Node.js 18+
 - Automation permissions: Terminal/Claude Code must have permission to control Mail.app (System Settings > Privacy & Security > Automation)
-- Automation permission for Mail.app (macOS prompts on first write). No Accessibility permission needed — no GUI scripting
+- Automation permission for Mail.app (macOS prompts on first write)
+- Accessibility permission for the host process (Terminal/iTerm/Claude) — replies paste via System Events
 
 ## Design Decisions
 
@@ -83,7 +84,7 @@ Or add to `.mcp.json` in your project:
 
 **JXA batch fetch as fallback.** `search_emails` uses JXA batch property access (`msgs.subject()` returns all subjects in one IPC call) instead of per-message iteration. Results are sorted by date descending in JS to handle Gmail IMAP's unreliable message ordering.
 
-**AppleScript for writes, body set as RTF and verified.** Compose/reply/forward use AppleScript to open the window, then `set content` with RTF (`textutil` HTML→RTF). Two Mail.app quirks shape this (verified 2026-08-28 against saved `.emlx` drafts): a `set content` issued before the window finishes loading is silently dropped, so the server retries until the body reads back; and `set content` on a reply window *replaces* Mail's quoted original, so the server rebuilds the quote itself from the original `.emlx` HTML in Mail's own `<blockquote type="cite">` shape. In-Reply-To/References and recipients come from Mail's `reply` command and survive. No GUI scripting, no clipboard, no focus stealing.
+**Replies are typed into Mail's own reply window.** `reply`/`forward` via AppleScript gives recipients, In-Reply-To/References, signature and Mail's native cite-bar quote. Any scripted `set content` on that window wipes the signature and quote (verified with screenshots 2026-08-28), so the body is pasted instead: markdown → HTML → RTF on the clipboard, ⌘V at the caret, then file URLs on the clipboard and ⌘V again for attachments. Result is body → attachments → signature → quote, exactly like a hand-written reply. The window is frontmost for about a second and focus is handed back; the text clipboard is restored afterwards. Verification is select-all → copy → read clipboard. New messages (nothing to lose) use `set content` with RTF and a readback retry.
 
 **Signature and quote stripping.** `get_email` strips email signatures (`-- ` delimiter, mobile app signatures) and quoted reply chains (`On ... wrote:`, Outlook `From:/Sent:` blocks, `>` quote lines). This keeps the returned body to just the actual message content, saving tokens.
 
@@ -98,7 +99,8 @@ Or add to `.mcp.json` in your project:
 - `search_emails` searches subject/sender only; use `search_body` for full-text (index builds incrementally in the background)
 - Compose opens a visible draft window; does not send automatically (by design, human-in-the-loop)
 - Mail.app autosaves every open compose window to Drafts. A draft you bin in the window can still leave a saved copy in Drafts — that's Mail, not this server
-- Attachment presence can't be read back from Mail.app scripting (always reports 0); the server verifies the files exist and lets the attach command's error surface instead
+- Reply/forward briefly brings the Mail window to the front to paste (≈1s), then returns focus. Non-text clipboard contents are not restored
+- Reply/forward take ~10s end to end (Mail's window load + two pastes + verification)
 - HTML emails are read as plain text (Mail.app `content` property returns plaintext extraction)
 
 ## Acknowledgements

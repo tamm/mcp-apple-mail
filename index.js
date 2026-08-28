@@ -599,10 +599,8 @@ function parseEmlx(filePath) {
     } catch {}
   }
 
-  // If HTML, keep the raw markup (for quoting) and extract text
-  let html = null;
+  // If HTML, extract text
   if (/text\/html/i.test(contentType)) {
-    html = decodedBody;
     decodedBody = htmlToText(decodedBody);
   }
 
@@ -611,8 +609,7 @@ function parseEmlx(filePath) {
     decodedBody = extractTextFromMultipart(body, contentType);
   }
 
-  if (/multipart/i.test(contentType)) { try { html = extractHtmlPart(body, contentType); } catch {} }
-  return { subject, from, to, cc, date, body: decodedBody, html };
+  return { subject, from, to, cc, date, body: decodedBody };
 }
 
 function decodeMimeWords(str) {
@@ -873,7 +870,7 @@ function runFts(query) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
     return execSync(
-      `sqlite3 ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
+      `sqlite3 -cmd ".timeout 5000" ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
       { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
     ).trim();
   } catch (error) {
@@ -885,7 +882,7 @@ function parseFts(query) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
     const raw = execSync(
-      `sqlite3 -json ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
+      `sqlite3 -json -cmd ".timeout 5000" ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
       { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
     ).trim();
     if (!raw) return [];
@@ -895,69 +892,92 @@ function parseFts(query) {
   }
 }
 
-function isIndexed(emailId) {
-  const rows = parseFts(`SELECT 1 FROM indexed WHERE id = ${Number(emailId)} LIMIT 1`);
-  return rows.length > 0;
+function sqlStr(s, max = 50000) {
+  // NUL bytes (seen in real subjects) truncate the SQL file when sqlite3 reads it.
+  return "'" + String(s || "").replace(/\0/g, "").slice(0, max).replace(/'/g, "''") + "'";
+}
+
+// Insert a batch of parsed emails into the FTS db in one sqlite3 process, one transaction.
+// SQL goes through a file: bodies are far too big for argv.
+function indexBatch(rows) {
+  if (!rows.length) return;
+  const ts = Math.floor(Date.now() / 1000);
+  const sql = ["BEGIN;"];
+  for (const r of rows) {
+    sql.push(`INSERT OR REPLACE INTO bodies (id, subject, sender, body) VALUES (${Number(r.id)}, ${sqlStr(r.subject, 1000)}, ${sqlStr(r.sender, 1000)}, ${sqlStr(r.body)});`);
+    sql.push(`INSERT OR REPLACE INTO indexed (id, ts) VALUES (${Number(r.id)}, ${ts});`);
+  }
+  sql.push("COMMIT;");
+  const f = join(tmpdir(), `mcp-mail-fts-${process.pid}-${Date.now()}.sql`);
+  writeFileSync(f, sql.join("\n"));
+  try {
+    execSync(`sqlite3 -cmd ".timeout 5000" ${JSON.stringify(FTS_DB)} < ${JSON.stringify(f)}`, { encoding: "utf-8", timeout: 60000, shell: "/bin/bash" });
+  } finally {
+    try { unlinkSync(f); } catch {}
+  }
 }
 
 function indexEmail(emailId, subject, sender, bodyText) {
-  const id = Number(emailId);
-  if (isIndexed(id)) return;
-  // Truncate body to 50k chars to keep index size reasonable
-  const body = (bodyText || "").slice(0, 50000).replace(/'/g, "''");
-  const subj = (subject || "").replace(/'/g, "''");
-  const from = (sender || "").replace(/'/g, "''");
-  try {
-    runFts(`INSERT OR REPLACE INTO bodies (id, subject, sender, body) VALUES (${id}, '${subj}', '${from}', '${body}')`);
-    runFts(`INSERT OR REPLACE INTO indexed (id, ts) VALUES (${id}, ${Math.floor(Date.now() / 1000)})`);
-  } catch {}
+  try { indexBatch([{ id: emailId, subject, sender, body: bodyText }]); } catch {}
+}
+
+// Message ids not yet in the FTS index, newest first. The two databases are separate files,
+// so the diff is done here, not in SQL.
+function unindexedIds() {
+  const all = parseSqlite(`SELECT ROWID as id FROM messages ORDER BY date_received DESC`).map(r => r.id);
+  const done = new Set(parseFts(`SELECT id FROM indexed`).map(r => r.id));
+  return all.filter(id => !done.has(id));
 }
 
 // --- Background indexing ---
-// Reads all unindexed .emlx files in a setImmediate loop — fast (SSD reads, no JXA),
-// yields between each email so the server stays responsive. Polls every 30s for new mail.
-
-function runIndexPass() {
+// Index up to `limit` unindexed emails, in batches of 200 per sqlite3 process.
+// Returns how many were indexed. Synchronous; callers bound it with `limit`.
+function runIndexPass(limit = Infinity) {
+  let n = 0;
   try {
-    const unindexed = parseSqlite(`
-      SELECT m.ROWID as id FROM messages m
-      LEFT JOIN (SELECT id FROM indexed) i ON i.id = m.ROWID
-      WHERE i.id IS NULL
-      ORDER BY m.date_received DESC
-    `);
-    for (const { id } of unindexed) {
-      try {
-        const emlxPath = findEmlxPath(id);
-        if (emlxPath) {
-          const data = parseEmlx(emlxPath);
-          indexEmail(id, data.subject, data.from, data.body);
-        }
-      } catch {}
+    const ids = unindexedIds().slice(0, limit);
+    for (let i = 0; i < ids.length; i += 200) {
+      const rows = [];
+      for (const id of ids.slice(i, i + 200)) {
+        try {
+          const p = findEmlxPath(id);
+          // No file on disk (not downloaded yet): record as indexed with empty body so we stop retrying it.
+          const d = p ? parseEmlx(p) : { subject: "", from: "", body: "" };
+          rows.push({ id, subject: d.subject, sender: d.from, body: d.body });
+        } catch {}
+      }
+      indexBatch(rows);
+      n += rows.length;
     }
-  } catch {}
+  } catch (e) {
+    console.error(`index pass failed: ${e.message}`);
+  }
+  return n;
 }
 
-function handleIndexNow(_args) {
-  runIndexPass();
+function handleIndexNow(args) {
+  const limit = Number(args?.limit) || 5000;
+  const n = runIndexPass(limit);
   const stats = ftsIndexStats();
-  return ok(`Index pass complete. ${ftsStatusLine(stats)}`);
+  return ok(`Indexed ${n.toLocaleString()} emails this pass. ${ftsStatusLine(stats)}${stats.pending ? " Call index_now again to continue." : ""}`);
 }
 
+// Background: small batches on a timer so the server starts at once and stays responsive.
 function startBackfill() {
-  ensureFtsDb();
-  runIndexPass();
+  try { ensureFtsDb(); } catch (e) { console.error(`FTS init failed: ${e.message}`); return; }
+  const tick = () => {
+    const n = runIndexPass(200);
+    setTimeout(tick, n ? 250 : 30000).unref(); // drain fast, then poll every 30s for new mail
+  };
+  setTimeout(tick, 1000).unref();
 }
 
 function ftsIndexStats() {
   try {
     const indexed = parseFts(`SELECT COUNT(*) as n FROM indexed`);
     const total = parseSqlite(`SELECT COUNT(*) as n FROM messages`);
-    const pending = parseFts(`SELECT COUNT(*) as n FROM queue WHERE status = 'pending'`);
-    return {
-      indexed: indexed[0]?.n || 0,
-      total: total[0]?.n || 0,
-      pending: pending[0]?.n || 0,
-    };
+    const i = indexed[0]?.n || 0, t = total[0]?.n || 0;
+    return { indexed: i, total: t, pending: Math.max(0, t - i) };
   } catch {
     return { indexed: 0, total: 0, pending: 0 };
   }
@@ -1249,58 +1269,19 @@ function formatBodyResults(results, query) {
 // DRAFT ONLY. Nothing in this section may send. Every path ends with an open
 // compose window that the human reviews and sends (or bins) themselves.
 //
-// Mail.app scripting facts (verified 2026-08-28 against saved .emlx drafts):
-// - `set content` on a reply/forward window REPLACES the whole body, including
-//   the quoted original. Inserting a paragraph does the same. So we rebuild the
-//   quote ourselves from the .emlx and set body+quote in one go.
-// - A `set content` issued before the window finishes loading is silently
-//   dropped. We retry until `content` reads back what we set.
-// - `content` never includes the signature or Mail's own quote, but it does
-//   include what we set, so it is a valid readback for our body.
-// - `attachments` on an outgoing message always reads back as 0, even when the
-//   saved draft has them. Can't verify attachments by readback; we verify the
-//   files exist and let the AppleScript error surface if the attach fails.
-// - In-Reply-To / References survive `set content` (checked on disk).
-
-function escapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-// Raw decoded text/html part of an RFC822 body (first one found, nested multiparts included), or null.
-function extractHtmlPart(body, contentType) {
-  const boundaryMatch = contentType.match(/boundary="?([^";\s]+)"?/i);
-  if (!boundaryMatch) return null;
-  for (const part of body.split("--" + boundaryMatch[1])) {
-    if (part.startsWith("--")) continue;
-    const m = part.match(/\r?\n\r?\n/);
-    if (!m) continue;
-    const headers = part.slice(0, m.index).replace(/\r?\n[ \t]+/g, " ");
-    let partBody = part.slice(m.index + m[0].length);
-    const ct = (headers.match(/Content-Type:\s*(.+)/i) || [])[1] || "";
-    if (/multipart/i.test(ct)) {
-      const nested = extractHtmlPart(partBody, ct);
-      if (nested) return nested;
-      continue;
-    }
-    if (!/text\/html/i.test(ct)) continue;
-    const cte = (headers.match(/Content-Transfer-Encoding:\s*(\S+)/i) || [])[1] || "";
-    if (/quoted-printable/i.test(cte)) partBody = decodeQuotedPrintable(partBody);
-    else if (/base64/i.test(cte)) { try { partBody = Buffer.from(partBody.replace(/\s/g, ""), "base64").toString("utf-8"); } catch {} }
-    return partBody;
-  }
-  return null;
-}
-
-// Quote block in Mail.app's own shape: attribution line, then the original's HTML verbatim
-// (nested quotes and formatting intact). Falls back to the text body if there is no HTML part.
-function quoteBlock(orig) {
-  const d = new Date(orig.date);
-  const when = isNaN(d) ? orig.date : d.toLocaleString("en-AU", { day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
-  const attribution = `On ${when}, ${orig.from} wrote:`;
-  const inner = orig.html ?? (orig.body || "").trim().split(/\r?\n/).map(escapeHtml).join("<br>");
-  const html = `<br><blockquote type="cite"><div>${escapeHtml(attribution)}</div><br><div>${inner}</div></blockquote>`;
-  return { html, attribution };
-}
+// Mail.app scripting facts (verified 2026-08-28 with screenshots + saved .emlx):
+// - On a reply/forward window, `set content` and paragraph inserts REPLACE the
+//   whole body: signature and Mail's quoted original are gone. `make new
+//   attachment` lands at the top. So replies use the GUI path instead: put the
+//   body (RTF) on the clipboard, paste at the caret, then paste file URLs. That
+//   keeps Mail's native signature + cite-bar quote and orders things body →
+//   attachments → signature → quote, exactly like a hand-written reply.
+// - The paste needs the window frontmost for ~1s; focus is handed back to the
+//   previous app afterwards. Pasting before the body finishes loading is
+//   silently dropped, so we wait for Mail's attribution line to appear.
+// - `content`/`attachments` readback on a reply window never reflect the GUI.
+//   Verification reads the body text through Accessibility instead.
+// - New messages (no quote/signature to lose) still use `set content`.
 
 function htmlToRtfFile(htmlBody) {
   const rtfPath = join(tmpdir(), `mcp-mail-body-${Date.now()}-${process.pid}.rtf`);
@@ -1333,6 +1314,13 @@ function asAttach(msgVar, paths) {
     `        make new attachment with properties {file name:POSIX file "${escapeForAppleScript(p)}"} at after the last paragraph`
   );
   return `\n    tell content of ${msgVar}\n${lines.join("\n")}\n    end tell`;
+}
+
+function clipboardText() {
+  try { return execSync("pbpaste", { encoding: "utf-8", timeout: 3000 }); } catch { return null; }
+}
+function setClipboardText(text) {
+  try { execSync("pbcopy", { input: text, timeout: 3000 }); } catch {}
 }
 
 function resolveAttachments(list) {
@@ -1378,30 +1366,71 @@ function handleCompose(args) {
       const replyAll = !!args?.reply_all;
       const loc = findMessageLocation(emailId);
       if (!loc) return err(`Email ${emailId} not found.`);
-      const emlxPath = findEmlxPath(emailId);
-      if (!emlxPath) return err(`Email ${emailId}: .emlx not on disk, cannot build quote.`);
-      const orig = parseEmlx(emlxPath);
+      if (!body.trim()) return err("body required.");
 
       const action = mode === "reply"
         ? (replyAll ? "reply msg with opening window and reply to all" : "reply msg with opening window")
         : "forward msg with opening window";
-      const quote = quoteBlock(orig);
-      rtfPath = htmlToRtfFile(markdownToHtml(body) + quote.html);
       const sourceExpr = asMailboxExpr(loc.account, loc.mailboxPath || [loc.mailbox]);
-      const script = `tell application "Mail"
+      rtfPath = htmlToRtfFile(markdownToHtml(body));
+      const firstLine = body.split(/\r?\n/).map(l => l.replace(/[*_#`>]/g, "").trim()).find(Boolean).slice(0, 40);
+      const savedClip = clipboardText();
+
+      // 1. Open the window, wait for Mail to fill in signature + quote, paste the body at the caret.
+      const open = runAppleScript(`
+set prevApp to (path to frontmost application as text)
+tell application "Mail"
     set targetBox to ${sourceExpr}
     set msgs to (every message of targetBox whose id is ${emailId})
     if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
     set msg to item 1 of msgs
-    set replyMsg to (${action})${asSetBodyVerified("replyMsg", rtfPath, quote.attribution)}${asAttach("replyMsg", attachments)}
+    set replyMsg to (${action})
+    set the clipboard to (read POSIX file "${escapeForAppleScript(rtfPath)}" as «class RTF »)
     set AppleScript's text item delimiters to ", "
-    return "ok|" & ((address of every to recipient of replyMsg) as text) & "|" & ((address of every cc recipient of replyMsg) as text)
-end tell`;
-      const result = runAppleScript(script, { timeout: 60000 });
-      if (result.startsWith("Error:")) return err(result.slice(7));
-      const [, to, cc] = result.split("|");
+    set recips to "|" & ((address of every to recipient of replyMsg) as text) & "|" & ((address of every cc recipient of replyMsg) as text)
+end tell
+-- the body (signature + quote) fills in asynchronously; a paste before that is dropped
+delay 1.5
+tell application "Mail" to activate
+tell application "System Events" to tell process "Mail"
+    set frontmost to true
+    delay 0.4
+    keystroke "v" using command down
+    delay 0.4
+end tell
+return prevApp & recips`, { timeout: 60000 });
+      if (open.startsWith("Error:")) return err(open.slice(7));
+      const [prevApp, to, cc] = open.split("|");
+
+      // 2. Files: one at a time — file URL on the clipboard, ⌘V, wait for Mail to finish inserting
+      //    (pasting several at once drops some; keystrokes during the insert lose attachments).
+      for (const p of attachments) {
+        runJxa(`ObjC.import("AppKit");
+          var pb = $.NSPasteboard.generalPasteboard; pb.clearContents;
+          pb.writeObjects($([$.NSURL.fileURLWithPath(${JSON.stringify(p)})]));`);
+        runAppleScript(`tell application "System Events" to tell process "Mail" to keystroke "v" using command down`);
+        execSync(`sleep ${(0.8 + statSync(p).size / 4e6).toFixed(1)}`); // ponytail: size-based wait; poll Mail's "Message Size" label if this proves flaky
+      }
+
+      // 3. Verify: select all, copy, read the clipboard — the editor's real text, ~0.5s.
+      //    Then caret to the top so the window shows the body, and give focus back.
+      runAppleScript(`tell application "System Events" to tell process "Mail"
+    keystroke "a" using command down
+    delay 0.2
+    keystroke "c" using command down
+    delay 0.3
+    key code 126 using command down
+end tell`);
+      const all = clipboardText() || "";
+      const title = runAppleScript(`tell application "System Events" to tell process "Mail" to get name of window 1`);
+      runAppleScript(`tell application "${escapeForAppleScript(prevApp)}" to activate`);
+      if (savedClip !== null) setClipboardText(savedClip);
+
+      const hasBody = all.includes(firstLine);
+      const hasQuote = /wrote:|skrev|Forwarded message|Begin forwarded/i.test(all);
+      if (!hasBody) return err(`Body not found in the ${mode} window after paste (window "${title}"). Draft left open for inspection.`);
       return ok([
-        `${mode === "reply" ? (replyAll ? "Reply-all" : "Reply") : "Forward"} draft opened for email ${emailId}. Body + quoted original verified by readback.`,
+        `${mode === "reply" ? (replyAll ? "Reply-all" : "Reply") : "Forward"} draft opened for email ${emailId}. Body verified on screen${hasQuote ? ", Mail's quoted original intact" : " (quote not detected — check the window)"}.`,
         `To: ${to || "(none)"}`,
         cc ? `Cc: ${cc}` : null,
         attachments.length ? `Attached: ${attachments.map(p => basename(p)).join(", ")}` : null,
@@ -1633,11 +1662,11 @@ export {
   extractTextFromMultipart,
   parseEmlx,
   handleCompose,
+  handleIndexNow,
+  ftsIndexStats,
   findEmlxPath,
   findAttachmentDir,
   shardDirs,
-  quoteBlock,
-  extractHtmlPart,
   accountUuidFromUrl,
   mailboxFromUrl,
   mboxPathFromUrl,
