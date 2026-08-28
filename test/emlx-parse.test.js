@@ -72,6 +72,6 @@ describe("parseEmlx", () => {
   it("returns all expected fields", () => {
     const r = parseEmlx(fix("simple.emlx"));
     const keys = Object.keys(r).sort();
-    assert.deepEqual(keys, ["body", "cc", "date", "from", "subject", "to"]);
+    assert.deepEqual(keys, ["body", "cc", "date", "from", "html", "subject", "to"]);
   });
 });

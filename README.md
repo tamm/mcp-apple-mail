@@ -8,7 +8,11 @@ Lean MCP server for Apple Mail on macOS. Read, search, compose, and organise ema
 
 Works with Gmail, iCloud, and standard IMAP accounts -- any account configured in Mail.app.
 
-**Draft-only by design.** This server cannot send email. `compose` opens a draft in Mail.app for human review and manual sending. Tamm decided 2026-05-12 that automated email sending is unwanted regardless of recipient — the send capability was physically removed, not just disabled, so it cannot be re-enabled via config or flag.
+> ## ⛔ THIS MCP INTENTIONALLY DOES NOT SEND EMAILS
+>
+> There is no send tool, no send AppleScript, no hidden flag. Every write path ends in an **open draft window** that a human reviews and sends — or bins.
+>
+> **To any agent using this server:** do not work around this. Do not script Mail.app's Send action, drive the GUI, save-then-send via another tool, or ask a different MCP/CLI to send on this server's behalf. If a task appears to require sending, stop and hand the draft to the human. Sending is the human's action, by the owner's explicit decision (2026-05-12), and circumventing it is a bug, not initiative.
 
 ## Why This One?
 
@@ -31,7 +35,8 @@ This server reads Mail.app's SQLite database (`Envelope Index`) directly for sea
 | `search_emails` | `query?`, `mailbox?` (default INBOX), `account?`, `limit?` (default 10, max 50) | One-line summaries: ID, date, sender, subject, read/flagged status |
 | `get_email` | `email_id` | Headers + cleaned body (signatures and quoted replies stripped) + attachment list |
 | `search_body` | `query`, `limit?` (default 20) | Relevance-ranked full-text results with body snippets; includes index coverage status |
-| `compose` | `mode` (new/reply/forward), `body` (markdown), `to?`, `subject?`, `cc?`, `email_id?`, `reply_all?` | Opens compose window in Mail.app with draft |
+| `draft_reply` | `email_id`, `body` (markdown), `reply_all?`, `attachments?` (file paths) | Opens a populated reply window: recipients, In-Reply-To/References threading, quoted original, your body on top, attachments. Body verified by readback. Never sends |
+| `compose` | `mode` (new/reply/forward), `body` (markdown), `to?`, `subject?`, `cc?`, `from?`, `email_id?`, `reply_all?`, `attachments?` | Opens compose window in Mail.app with draft. `mode=reply` is the same as `draft_reply` |
 | `move_email` | `email_id`, `destination`, `account?` | Confirmation message |
 | `archive_emails` | `email_ids` (array), `account?` | Archive summary (Gmail: removes INBOX label) |
 | `download_attachment` | `email_id`, `attachment_name?`, `destination?` | Saves attachment(s) to disk (default `/tmp/mail-attachments/`) |
@@ -68,7 +73,7 @@ Or add to `.mcp.json` in your project:
 - macOS with Mail.app configured (at least one account)
 - Node.js 18+
 - Automation permissions: Terminal/Claude Code must have permission to control Mail.app (System Settings > Privacy & Security > Automation)
-- Accessibility permission for compose operations (System Settings > Privacy & Security > Accessibility)
+- Automation permission for Mail.app (macOS prompts on first write). No Accessibility permission needed — no GUI scripting
 
 ## Design Decisions
 
@@ -78,7 +83,7 @@ Or add to `.mcp.json` in your project:
 
 **JXA batch fetch as fallback.** `search_emails` uses JXA batch property access (`msgs.subject()` returns all subjects in one IPC call) instead of per-message iteration. Results are sorted by date descending in JS to handle Gmail IMAP's unreliable message ordering.
 
-**AppleScript + clipboard paste for writes.** Compose/reply/forward use AppleScript to open the window, then clipboard paste for the body: `textutil` converts HTML to RTF, `pbcopy` copies it, System Events pastes with Cmd+V. This is the only way to get rendered HTML into Mail.app -- the `content` property only accepts plain text.
+**AppleScript for writes, body set as RTF and verified.** Compose/reply/forward use AppleScript to open the window, then `set content` with RTF (`textutil` HTML→RTF). Two Mail.app quirks shape this (verified 2026-08-28 against saved `.emlx` drafts): a `set content` issued before the window finishes loading is silently dropped, so the server retries until the body reads back; and `set content` on a reply window *replaces* Mail's quoted original, so the server rebuilds the quote itself from the original `.emlx` HTML in Mail's own `<blockquote type="cite">` shape. In-Reply-To/References and recipients come from Mail's `reply` command and survive. No GUI scripting, no clipboard, no focus stealing.
 
 **Signature and quote stripping.** `get_email` strips email signatures (`-- ` delimiter, mobile app signatures) and quoted reply chains (`On ... wrote:`, Outlook `From:/Sent:` blocks, `>` quote lines). This keeps the returned body to just the actual message content, saving tokens.
 
@@ -92,6 +97,8 @@ Or add to `.mcp.json` in your project:
 - Mail.app must be running and configured with at least one account
 - `search_emails` searches subject/sender only; use `search_body` for full-text (index builds incrementally in the background)
 - Compose opens a visible draft window; does not send automatically (by design, human-in-the-loop)
+- Mail.app autosaves every open compose window to Drafts. A draft you bin in the window can still leave a saved copy in Drafts — that's Mail, not this server
+- Attachment presence can't be read back from Mail.app scripting (always reports 0); the server verifies the files exist and lets the attach command's error surface instead
 - HTML emails are read as plain text (Mail.app `content` property returns plaintext extraction)
 
 ## Acknowledgements

@@ -311,8 +311,23 @@ const TOOLS = [
         email_id: { type: "number", description: "Email ID (reply/forward)." },
         reply_all: { type: "boolean", description: "Reply all." },
         from: { type: "string", description: "Sender email (new). Sets the From address; Mail.app applies that account's default signature." },
+        attachments: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach. To attach files from another email, run download_attachment first and pass the saved paths." },
       },
       required: ["mode", "body"],
+    },
+  },
+  {
+    name: "draft_reply",
+    description: "Open a populated reply (or reply-all) window in Mail.app for an email: correct recipients, In-Reply-To threading, quoted original, your body on top, optional attachments. Body is verified by readback before returning. NEVER sends — the human reviews and hits Send. Body is markdown.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email_id: { type: "number", description: "Email ID from search_emails." },
+        body: { type: "string", description: "Markdown body placed above the quoted original." },
+        reply_all: { type: "boolean", description: "Reply to all recipients (default false)." },
+        attachments: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach. Use download_attachment to pull files out of another email first." },
+      },
+      required: ["email_id", "body"],
     },
   },
   {
@@ -396,6 +411,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = handleGetEmail(args); break;
       case "compose":
         result = handleCompose(args); break;
+      case "draft_reply":
+        result = handleCompose({ ...args, mode: "reply" }); break;
       case "move_email":
         result = handleMoveEmail(args); break;
       case "archive_emails":
@@ -481,9 +498,30 @@ function discoverInternalUuid() {
   } catch {}
 }
 
-// Shard dirs: Data/X/Y/Messages where X=0-9, Y=1-6
-const SHARD_PAIRS = [];
-for (let x = 0; x <= 9; x++) for (let y = 1; y <= 6; y++) SHARD_PAIRS.push(`${x}/${y}`);
+// Mail shards a mailbox's Data dir as Data/, Data/X/ or Data/X/Y/ (X, Y single digits,
+// Y observed up to 7). Enumerate what exists rather than guessing the ranges.
+function shardDirs(dataDir) {
+  const out = [dataDir];
+  let lvl1 = [];
+  try { lvl1 = readdirSync(dataDir).filter(d => /^\d+$/.test(d)).map(d => `${dataDir}/${d}`); } catch { return out; }
+  for (const a of lvl1) {
+    out.push(a);
+    try { for (const b of readdirSync(a)) if (/^\d+$/.test(b)) out.push(`${a}/${b}`); } catch {}
+  }
+  return out;
+}
+
+// Data dir for the mailbox a message physically lives in (Gmail: All Mail, not the label mailbox).
+function messageDataDir(emailId) {
+  if (!internalUuid) discoverInternalUuid();
+  if (!internalUuid) return null;
+  const rows = parseSqlite(`SELECT mb.url FROM messages m JOIN mailboxes mb ON mb.ROWID = m.mailbox WHERE m.ROWID = ${Number(emailId)}`);
+  if (!rows.length) return null;
+  const acctUuid = accountUuidFromUrl(rows[0].url);
+  const mboxSegs = mboxPathFromUrl(rows[0].url);
+  if (!acctUuid || !mboxSegs) return null;
+  return `${MAIL_V10_DIR}/${acctUuid}/${mboxSegs.join("/")}/${internalUuid}/Data`;
+}
 
 function accountUuidFromUrl(url) {
   const m = url.match(/^[a-z]+:\/\/([A-F0-9-]+)\//i);
@@ -499,36 +537,16 @@ function mboxPathFromUrl(url) {
 }
 
 function findEmlxPath(emailId) {
-  if (!internalUuid) return null;
+  const dataDir = messageDataDir(emailId);
+  if (!dataDir) return null;
   const id = Number(emailId);
-
-  // Get the mailbox URL where the file physically lives
-  // For Gmail, that's All Mail (messages.mailbox), not the label mailbox
-  const rows = parseSqlite(`SELECT mb.url FROM messages m JOIN mailboxes mb ON mb.ROWID = m.mailbox WHERE m.ROWID = ${id}`);
-  if (!rows.length) return null;
-
-  const url = rows[0].url;
-  const acctUuid = accountUuidFromUrl(url);
-  const mboxSegs = mboxPathFromUrl(url);
-  if (!acctUuid || !mboxSegs) return null;
-
-  const mboxDir = `${MAIL_V10_DIR}/${acctUuid}/${mboxSegs.join("/")}/${internalUuid}/Data`;
-
-  // Brute-force shard dirs (<1ms on SSD)
-  for (const shard of SHARD_PAIRS) {
-    const path = `${mboxDir}/${shard}/Messages/${id}.emlx`;
-    try {
-      accessSync(path, fsConst.R_OK);
-      return path;
-    } catch {}
+  // .partial.emlx = body present, attachments not fully downloaded. Still readable.
+  for (const dir of shardDirs(dataDir)) {
+    for (const name of [`${id}.emlx`, `${id}.partial.emlx`]) {
+      const path = `${dir}/Messages/${name}`;
+      if (existsSync(path)) return path;
+    }
   }
-  // Also check un-sharded Messages dir
-  const flatPath = `${mboxDir}/Messages/${id}.emlx`;
-  try {
-    accessSync(flatPath, fsConst.R_OK);
-    return flatPath;
-  } catch {}
-
   return null;
 }
 
@@ -581,8 +599,10 @@ function parseEmlx(filePath) {
     } catch {}
   }
 
-  // If HTML, extract text
+  // If HTML, keep the raw markup (for quoting) and extract text
+  let html = null;
   if (/text\/html/i.test(contentType)) {
+    html = decodedBody;
     decodedBody = htmlToText(decodedBody);
   }
 
@@ -591,7 +611,8 @@ function parseEmlx(filePath) {
     decodedBody = extractTextFromMultipart(body, contentType);
   }
 
-  return { subject, from, to, cc, date, body: decodedBody };
+  if (/multipart/i.test(contentType)) { try { html = extractHtmlPart(body, contentType); } catch {} }
+  return { subject, from, to, cc, date, body: decodedBody, html };
 }
 
 function decodeMimeWords(str) {
@@ -750,6 +771,8 @@ function refreshAccountNamesAsync() {
 
 let lastRefresh = 0;
 function getAccountNames() {
+  // Empty cache (Mail not running at startup, or imported for tests): fetch synchronously.
+  if (Object.keys(accountNameCache).length === 0) accountNameCache = fetchAccountNames();
   // SWR: refresh at most once per 60s
   const now = Date.now();
   if (now - lastRefresh > 60000) {
@@ -1222,94 +1245,174 @@ function formatBodyResults(results, query) {
 }
 
 // --- compose ---
+//
+// DRAFT ONLY. Nothing in this section may send. Every path ends with an open
+// compose window that the human reviews and sends (or bins) themselves.
+//
+// Mail.app scripting facts (verified 2026-08-28 against saved .emlx drafts):
+// - `set content` on a reply/forward window REPLACES the whole body, including
+//   the quoted original. Inserting a paragraph does the same. So we rebuild the
+//   quote ourselves from the .emlx and set body+quote in one go.
+// - A `set content` issued before the window finishes loading is silently
+//   dropped. We retry until `content` reads back what we set.
+// - `content` never includes the signature or Mail's own quote, but it does
+//   include what we set, so it is a valid readback for our body.
+// - `attachments` on an outgoing message always reads back as 0, even when the
+//   saved draft has them. Can't verify attachments by readback; we verify the
+//   files exist and let the AppleScript error surface if the attach fails.
+// - In-Reply-To / References survive `set content` (checked on disk).
 
-// Write HTML body to a temp RTF file, set it on the message, then delete the file.
-// Returns the AppleScript snippet to embed (reads from tmpPath).
-function setRtfBody(htmlBody, msgVar = "newMsg") {
-  const rtfPath = `/tmp/mcp-mail-body-${Date.now()}.rtf`;
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Raw decoded text/html part of an RFC822 body (first one found, nested multiparts included), or null.
+function extractHtmlPart(body, contentType) {
+  const boundaryMatch = contentType.match(/boundary="?([^";\s]+)"?/i);
+  if (!boundaryMatch) return null;
+  for (const part of body.split("--" + boundaryMatch[1])) {
+    if (part.startsWith("--")) continue;
+    const m = part.match(/\r?\n\r?\n/);
+    if (!m) continue;
+    const headers = part.slice(0, m.index).replace(/\r?\n[ \t]+/g, " ");
+    let partBody = part.slice(m.index + m[0].length);
+    const ct = (headers.match(/Content-Type:\s*(.+)/i) || [])[1] || "";
+    if (/multipart/i.test(ct)) {
+      const nested = extractHtmlPart(partBody, ct);
+      if (nested) return nested;
+      continue;
+    }
+    if (!/text\/html/i.test(ct)) continue;
+    const cte = (headers.match(/Content-Transfer-Encoding:\s*(\S+)/i) || [])[1] || "";
+    if (/quoted-printable/i.test(cte)) partBody = decodeQuotedPrintable(partBody);
+    else if (/base64/i.test(cte)) { try { partBody = Buffer.from(partBody.replace(/\s/g, ""), "base64").toString("utf-8"); } catch {} }
+    return partBody;
+  }
+  return null;
+}
+
+// Quote block in Mail.app's own shape: attribution line, then the original's HTML verbatim
+// (nested quotes and formatting intact). Falls back to the text body if there is no HTML part.
+function quoteBlock(orig) {
+  const d = new Date(orig.date);
+  const when = isNaN(d) ? orig.date : d.toLocaleString("en-AU", { day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
+  const attribution = `On ${when}, ${orig.from} wrote:`;
+  const inner = orig.html ?? (orig.body || "").trim().split(/\r?\n/).map(escapeHtml).join("<br>");
+  const html = `<br><blockquote type="cite"><div>${escapeHtml(attribution)}</div><br><div>${inner}</div></blockquote>`;
+  return { html, attribution };
+}
+
+function htmlToRtfFile(htmlBody) {
+  const rtfPath = join(tmpdir(), `mcp-mail-body-${Date.now()}-${process.pid}.rtf`);
   const rtf = execSync(
     `textutil -stdin -format html -inputencoding UTF-8 -convert rtf -stdout`,
     { input: Buffer.from(htmlBody, "utf8"), timeout: 10000 }
   );
   writeFileSync(rtfPath, rtf);
-  return { tmpPath: rtfPath, snippet: `set content of ${msgVar} to (read POSIX file "${rtfPath}" as «class RTF »)` };
+  return rtfPath;
+}
+
+// AppleScript: set RTF body on msgVar, retry until readback contains `marker`.
+function asSetBodyVerified(msgVar, rtfPath, marker) {
+  return `
+    set bodyOk to false
+    repeat 20 times
+        set content of ${msgVar} to (read POSIX file "${escapeForAppleScript(rtfPath)}" as «class RTF »)
+        delay 0.5
+        if (content of ${msgVar}) contains "${escapeForAppleScript(marker)}" then
+            set bodyOk to true
+            exit repeat
+        end if
+    end repeat
+    if not bodyOk then return "Error: body did not stick after 20 tries (Mail.app busy?)"`;
+}
+
+function asAttach(msgVar, paths) {
+  if (!paths.length) return "";
+  const lines = paths.map(p =>
+    `        make new attachment with properties {file name:POSIX file "${escapeForAppleScript(p)}"} at after the last paragraph`
+  );
+  return `\n    tell content of ${msgVar}\n${lines.join("\n")}\n    end tell`;
+}
+
+function resolveAttachments(list) {
+  const paths = (list || []).map(p => String(p).replace(/^~(?=\/)/, process.env.HOME));
+  for (const p of paths) {
+    if (!existsSync(p) || !statSync(p).isFile()) throw new Error(`Attachment not found: ${p}`);
+  }
+  return paths;
 }
 
 function handleCompose(args) {
   const mode = args?.mode;
   const body = args?.body || "";
-  const htmlBody = markdownToHtml(body);
-
-  if (mode === "new") {
-    const subject = args?.subject || "";
-    const to = args?.to || "";
-    const cc = args?.cc || "";
-    const from = args?.from || "";
-
-    let tmpPath = null;
-    try {
-      let bodySnippet = "";
-      if (body.trim()) {
-        const rtf = setRtfBody(htmlBody, "newMsg");
-        tmpPath = rtf.tmpPath;
-        bodySnippet = `\n    ${rtf.snippet}`;
-      }
+  const attachments = resolveAttachments(args?.attachments);
+  let rtfPath = null;
+  try {
+    if (mode === "new") {
+      const subject = args?.subject || "";
+      const to = args?.to || "";
+      const cc = args?.cc || "";
+      const from = args?.from || "";
       let script = `tell application "Mail"
     set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:true}`;
       if (to) script += `\n    tell newMsg\n        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}\n    end tell`;
       if (cc) script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:"${escapeForAppleScript(cc)}"}\n    end tell`;
       if (from) script += `\n    tell newMsg\n        set sender to "${escapeForAppleScript(from)}"\n    end tell`;
-      script += bodySnippet;
-      script += `\n    activate\nend tell`;
-      runAppleScript(script);
-    } finally {
-      if (tmpPath) try { unlinkSync(tmpPath); } catch {}
-    }
-    return ok(`Draft created: ${subject}`);
-  }
-
-  if (mode === "reply" || mode === "forward") {
-    const emailId = args?.email_id;
-    if (!emailId) return err("email_id required for reply/forward.");
-    const replyAll = args?.reply_all || false;
-
-    const loc = findMessageLocation(emailId);
-    if (!loc) return err(`Email ${emailId} not found.`);
-
-    const action =
-      mode === "reply"
-        ? replyAll
-          ? "reply msg with opening window and reply to all"
-          : "reply msg with opening window"
-        : "forward msg with opening window";
-
-    let tmpPath = null;
-    try {
-      let bodySnippet = "";
       if (body.trim()) {
-        const rtf = setRtfBody(htmlBody, "replyMsg");
-        tmpPath = rtf.tmpPath;
-        bodySnippet = `\n    ${rtf.snippet}`;
+        rtfPath = htmlToRtfFile(markdownToHtml(body));
+        // Marker: first non-empty line of the markdown, stripped of emphasis chars.
+        const marker = body.split(/\r?\n/).map(l => l.replace(/[*_#`>]/g, "").trim()).find(Boolean).slice(0, 40);
+        script += asSetBodyVerified("newMsg", rtfPath, marker);
       }
+      script += asAttach("newMsg", attachments);
+      script += `\n    return "ok"\nend tell`;
+      const result = runAppleScript(script);
+      if (result.startsWith("Error:")) return err(result.slice(7));
+      return ok(`Draft opened: "${subject}"${attachments.length ? ` with ${attachments.length} attachment(s)` : ""}. Body verified. Not sent — review in Mail.app.`);
+    }
+
+    if (mode === "reply" || mode === "forward") {
+      const emailId = Number(args?.email_id);
+      if (!emailId) return err("email_id required for reply/forward.");
+      const replyAll = !!args?.reply_all;
+      const loc = findMessageLocation(emailId);
+      if (!loc) return err(`Email ${emailId} not found.`);
+      const emlxPath = findEmlxPath(emailId);
+      if (!emlxPath) return err(`Email ${emailId}: .emlx not on disk, cannot build quote.`);
+      const orig = parseEmlx(emlxPath);
+
+      const action = mode === "reply"
+        ? (replyAll ? "reply msg with opening window and reply to all" : "reply msg with opening window")
+        : "forward msg with opening window";
+      const quote = quoteBlock(orig);
+      rtfPath = htmlToRtfFile(markdownToHtml(body) + quote.html);
       const sourceExpr = asMailboxExpr(loc.account, loc.mailboxPath || [loc.mailbox]);
       const script = `tell application "Mail"
     set targetBox to ${sourceExpr}
-    set msgs to (every message of targetBox whose id is ${Number(emailId)})
+    set msgs to (every message of targetBox whose id is ${emailId})
     if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
     set msg to item 1 of msgs
-    set replyMsg to (${action})${bodySnippet}
-    activate
-    return "ok"
+    set replyMsg to (${action})${asSetBodyVerified("replyMsg", rtfPath, quote.attribution)}${asAttach("replyMsg", attachments)}
+    set AppleScript's text item delimiters to ", "
+    return "ok|" & ((address of every to recipient of replyMsg) as text) & "|" & ((address of every cc recipient of replyMsg) as text)
 end tell`;
-      const result = runAppleScript(script);
+      const result = runAppleScript(script, { timeout: 60000 });
       if (result.startsWith("Error:")) return err(result.slice(7));
-    } finally {
-      if (tmpPath) try { unlinkSync(tmpPath); } catch {}
+      const [, to, cc] = result.split("|");
+      return ok([
+        `${mode === "reply" ? (replyAll ? "Reply-all" : "Reply") : "Forward"} draft opened for email ${emailId}. Body + quoted original verified by readback.`,
+        `To: ${to || "(none)"}`,
+        cc ? `Cc: ${cc}` : null,
+        attachments.length ? `Attached: ${attachments.map(p => basename(p)).join(", ")}` : null,
+        "Not sent — the human reviews and sends from Mail.app.",
+      ].filter(Boolean).join("\n"));
     }
-    return ok(`${mode === "reply" ? "Reply" : "Forward"} draft created for email ${emailId}.`);
-  }
 
-  return err(`Invalid mode: ${mode}. Use "new", "reply", or "forward".`);
+    return err(`Invalid mode: ${mode}. Use "new", "reply", or "forward".`);
+  } finally {
+    if (rtfPath) try { unlinkSync(rtfPath); } catch {}
+  }
 }
 
 // --- move_email ---
@@ -1435,25 +1538,12 @@ function getAttachmentInfo(emailId) {
 }
 
 function findAttachmentDir(emailId) {
-  if (!internalUuid) return null;
-  const id = Number(emailId);
-  const rows = parseSqlite(`SELECT mb.url FROM messages m JOIN mailboxes mb ON mb.ROWID = m.mailbox WHERE m.ROWID = ${id}`);
-  if (!rows.length) return null;
-
-  const url = rows[0].url;
-  const acctUuid = accountUuidFromUrl(url);
-  const mboxSegs = mboxPathFromUrl(url);
-  if (!acctUuid || !mboxSegs) return null;
-
-  const mboxDir = `${MAIL_V10_DIR}/${acctUuid}/${mboxSegs.join("/")}/${internalUuid}/Data`;
-
-  // Check sharded dirs then flat
-  for (const shard of SHARD_PAIRS) {
-    const dir = `${mboxDir}/${shard}/Attachments/${id}`;
-    if (existsSync(dir)) return dir;
+  const dataDir = messageDataDir(emailId);
+  if (!dataDir) return null;
+  for (const dir of shardDirs(dataDir)) {
+    const att = `${dir}/Attachments/${Number(emailId)}`;
+    if (existsSync(att)) return att;
   }
-  const flatDir = `${mboxDir}/Attachments/${id}`;
-  if (existsSync(flatDir)) return flatDir;
   return null;
 }
 
@@ -1542,6 +1632,12 @@ export {
   htmlToText,
   extractTextFromMultipart,
   parseEmlx,
+  handleCompose,
+  findEmlxPath,
+  findAttachmentDir,
+  shardDirs,
+  quoteBlock,
+  extractHtmlPart,
   accountUuidFromUrl,
   mailboxFromUrl,
   mboxPathFromUrl,
