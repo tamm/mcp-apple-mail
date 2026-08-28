@@ -1391,9 +1391,22 @@ tell application "Mail"
 end tell
 -- the body (signature + quote) fills in asynchronously; a paste before that is dropped
 delay 1.5
+-- park the compose window over the caller's own window so it doesn't cover the rest of the desk
+set spot to missing value
+try
+    tell application "System Events" to tell (first process whose frontmost is true)
+        set spot to {position of window 1, size of window 1}
+    end tell
+end try
 tell application "Mail" to activate
 tell application "System Events" to tell process "Mail"
     set frontmost to true
+    if spot is not missing value then
+        try
+            set position of window 1 to item 1 of spot
+            set size of window 1 to item 2 of spot
+        end try
+    end if
     delay 0.4
     keystroke "v" using command down
     delay 0.4
